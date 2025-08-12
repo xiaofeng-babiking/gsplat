@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -7,6 +8,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
+from pyquaternion import Quaternion
 from pycolmap import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
@@ -374,11 +376,26 @@ class Dataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        mask = np.ones(shape=image.shape[:2], dtype=np.uint8)
+        image_mask = (
+            imageio.imread(self.parser.mask_paths[index])
+            if hasattr(self.parser, "mask_paths")
+            else None
+        )
+        if image_mask is not None:
+            mask = np.logical_and(mask, image_mask)
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        camtoworld = self.parser.camtoworlds[index]
+        camtoworld_rs = (
+            self.parser.camtoworlds_rs[index]
+            if hasattr(self.parser, "camtoworlds_rs")
+            else copy.deepcopy(camtoworld)
+        )
+        camera_mask = self.parser.mask_dict[camera_id]
+        if camera_mask is not None:
+            mask = np.logical_and(mask, camera_mask)
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -401,7 +418,8 @@ class Dataset:
 
         data = {
             "K": torch.from_numpy(K).float(),
-            "camtoworld": torch.from_numpy(camtoworlds).float(),
+            "camtoworld": torch.from_numpy(camtoworld).float(),
+            "camtoworld_rs": torch.from_numpy(camtoworld_rs).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
@@ -410,11 +428,11 @@ class Dataset:
 
         if self.load_depths:
             # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
+            worldtocam = np.linalg.inv(camtoworld)
             image_name = self.parser.image_names[index]
             point_indices = self.parser.point_indices[image_name]
             points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
+            points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
             points_proj = (K @ points_cam.T).T
             points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
             depths = points_cam[:, 2]  # (M,)

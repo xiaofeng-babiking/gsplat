@@ -15,7 +15,8 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset
+from datasets.scannetpp_parser import ScannetppParser as Parser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -35,6 +36,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
+from gsplat.cuda._wrapper import RollingShutterType
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -186,6 +188,15 @@ class Config:
 
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
+
+    # Rolling shutter type
+    rolling_shutter: Literal[
+        "rolling_top_to_bottom",
+        "rolling_left_to_right",
+        "rolling_bottom_to_top",
+        "rolling_right_to_left",
+        "global",
+    ] = "global"
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -488,6 +499,8 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        camtoworlds_rs: Optional[Tensor] = None,
+        rolling_shutter: Optional[RollingShutterType] = RollingShutterType.GLOBAL,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -521,6 +534,8 @@ class Runner:
             opacities=opacities,
             colors=colors,
             viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+            viewmats_rs=torch.linalg.inv(camtoworlds_rs),  # [C, 4, 4]
+            rolling_shutter=rolling_shutter,
             Ks=Ks,  # [C, 3, 3]
             width=width,
             height=height,
@@ -613,6 +628,7 @@ class Runner:
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            camtoworlds_rs = data["camtoworld_rs"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
@@ -638,6 +654,8 @@ class Runner:
             # forward
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
+                camtoworlds_rs=camtoworlds_rs,
+                rolling_shutter=RollingShutterType[cfg.rolling_shutter.upper()],
                 Ks=Ks,
                 width=width,
                 height=height,
@@ -918,6 +936,7 @@ class Runner:
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
+            camtoworlds_rs = data["camtoworld_rs"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
@@ -927,6 +946,8 @@ class Runner:
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
+                camtoworlds_rs=camtoworlds_rs,
+                rolling_shutter=RollingShutterType[cfg.rolling_shutter.upper()],
                 Ks=Ks,
                 width=width,
                 height=height,
@@ -1047,6 +1068,8 @@ class Runner:
 
             renders, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
+                camtoworlds_rs=camtoworlds,
+                rolling_shutter=RollingShutterType[cfg.rolling_shutter.upper()],
                 Ks=Ks,
                 width=width,
                 height=height,
@@ -1109,6 +1132,8 @@ class Runner:
 
         render_colors, render_alphas, info = self.rasterize_splats(
             camtoworlds=c2w[None],
+            camtoworlds_rs=c2w[None],
+            rolling_shutter=RollingShutterType[cfg.rolling_shutter.upper()],
             Ks=K[None],
             width=width,
             height=height,
