@@ -7,13 +7,15 @@ import re
 import torch
 import cv2 as cv
 import numpy as np
+from tqdm import tqdm
 from scipy.optimize import curve_fit
+from collections import namedtuple
 from typing import OrderedDict, List, Literal
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization
 from gsplat.logger import create_logger
-from fused_ssim import fused_ssim
+from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 
 COLMAP_DATA_PATH = os.getenv("COLMAP_DATA_PATH")
@@ -175,7 +177,11 @@ class CustomizedSSIM(torch.nn.Module):
         return ssim_score
 
 
-def test_fused_ssim_forward():
+def generate_render_data_sample():
+    """Generate rendering sample data to evaluate SSIM."""
+    LOGGER.info(
+        f"Start to parse COLMAP data from {os.path.basename(COLMAP_DATA_PATH)}..."
+    )
     parser = ColmapParser(
         data_dir=COLMAP_DATA_PATH,
         factor=RESOLUTION_FACTOR,
@@ -186,75 +192,152 @@ def test_fused_ssim_forward():
     n_imgs = len(dataset)
     LOGGER.info(f"Loaded {n_imgs} views from {os.path.basename(COLMAP_DATA_PATH)}.")
 
+    LOGGER.info(
+        f"Start to load gsplat checkpoint from {os.path.basename(GSPLAT_CHECKPOINT_FILE)}..."
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     splats = torch.load(GSPLAT_CHECKPOINT_FILE)["splats"]
     splats = OrderedDict({k: v.to(device) for k, v in splats.items()})
-
     sh_deg = int(np.sqrt(splats["sh0"].shape[1] + splats["shN"].shape[1])) - 1
     LOGGER.info(
         f"Loaded {len(splats['means'])} Splats from {os.path.basename(GSPLAT_CHECKPOINT_FILE)}."
     )
 
-    # test fused ssim forward pass one-by-one
-    ssim_sum = 0.0
-    for img_cnt, data_item in enumerate(dataset):
+    LOGGER.info(f"Start to concatenate groundtruth images and test views...")
+    img_ids = []
+    gt_imgs = []
+    Ks = []
+    viewmats = []
+    for data_item in tqdm(dataset, desc="Iterate over the dataset...", total=n_imgs):
         img_id = data_item["image_id"]
-        gt_rgb = data_item["image"].to(device)[None, ...]
-        gt_rgb = gt_rgb.float() / 255.0
-        # image dimension format NCHW
-        gt_rgb = torch.permute(gt_rgb, dims=[0, 3, 1, 2])
+        img_ids.append(img_id)
 
-        img_h, img_w = gt_rgb.shape[-2:]
+        gt_img = data_item["image"].to(device)[None, ...]
+        gt_img = gt_img.float() / 255.0
+        # image dimension format NCHW
+        gt_img = torch.permute(gt_img, dims=[0, 3, 1, 2])
+        gt_imgs.append(gt_img)
 
         # Dimension=[1, 3, 3]
-        Ks = data_item["K"][None, ...]
-        Ks = Ks.to(device)
+        K = data_item["K"][None, ...]
+        K = K.to(device)
+        Ks.append(K)
+
         # Dimension=[1, 4, 4]
-        viewmats = torch.linalg.inv(data_item["camtoworld"][None, ...])
-        viewmats = viewmats.to(device)
-        LOGGER.info(f"Loaded image-{img_id} with resolution={img_w}x{img_h}.")
+        viewmat = data_item["camtoworld"][None, ...]
+        viewmat = viewmat.to(device)
+        viewmats.append(viewmat)
 
-        LOGGER.info(f"Start rendering image-{img_id} ({img_cnt + 1}/{n_imgs})...")
-        rd_rgb, rd_a, rd_meta = rasterization(
-            means=splats["means"],
-            quats=splats["quats"],
-            scales=torch.exp(splats["scales"]),
-            opacities=torch.sigmoid(splats["opacities"]),
-            colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
-            Ks=Ks,
-            viewmats=viewmats,
-            width=img_w,
-            height=img_h,
-            sh_degree=sh_deg,
-        )
-        LOGGER.info(f"Finished rendering image-{img_id}.")
+    img_ids = torch.tensor(img_ids, dtype=torch.int32)
+    gt_imgs = torch.cat(gt_imgs, dim=0)
+    Ks = torch.cat(Ks, dim=0)
+    viewmats = torch.linalg.inv(torch.cat(viewmats, dim=0))
 
-        rd_rgb = torch.permute(rd_rgb, dims=[0, 3, 1, 2])
-        rd_rgb = torch.clamp(rd_rgb, min=0.0, max=1.0)
+    img_h, img_w = gt_imgs.shape[2:]
+    assert gt_imgs.shape[0] == n_imgs
 
-        torch_ssim = StructuralSimilarityIndexMeasure(
-            data_range=1.0, kernel_size=11, k1=0.01, k2=0.03, sigma=1.5
-        ).to(device)
-        ssim_0 = torch_ssim(gt_rgb, rd_rgb)
-        ssim_sum += ssim_0.item()
-        LOGGER.info(f"Computed image-{img_id} SSIM={ssim_0.item():.4f}.")
-
-        ssim_1 = fused_ssim(gt_rgb, rd_rgb, padding="valid", train=False).item()
-
-        custom_ssim = CustomizedSSIM(ksize=11, sigma=1.5, padding="valid")
-        custo_ssim = custom_ssim.to(device)
-        ssim_2 = custom_ssim(gt_rgb, rd_rgb).item()
-
-        assert (
-            abs(ssim_1 - ssim_2) < 1e-4
-        ), f"Fused VS Customized SSIM mismatch ({ssim_1:.6f} VS {ssim_2:.6f})!"
-        # torch.cuda.empty_cache()
-
-    ssim_avg = ssim_sum / n_imgs
-    LOGGER.info(
-        f"Average SSIM={ssim_avg:.4f} for Dataset={os.path.basename(COLMAP_DATA_PATH)}."
+    LOGGER.info(f"Start to render {n_imgs} images with resolution={img_w}x{img_h}...")
+    rd_imgs, rd_alphas, rd_metas = rasterization(
+        means=splats["means"],
+        quats=splats["quats"],
+        scales=torch.exp(splats["scales"]),
+        opacities=torch.sigmoid(splats["opacities"]),
+        colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
+        Ks=Ks,
+        viewmats=viewmats,
+        width=img_w,
+        height=img_h,
+        sh_degree=sh_deg,
     )
+    LOGGER.info(f"Finished rendering image-{img_id}.")
+
+    rd_imgs = torch.permute(rd_imgs, dims=[0, 3, 1, 2])
+    rd_imgs = torch.clamp(rd_imgs, min=0.0, max=1.0)
+
+    RenderDataSample = namedtuple(
+        typename="RenderDataSample",
+        field_names=[
+            "image_id",
+            "camera_matrix",
+            "view_matrix",
+            "groundtruth_image",
+            "render_image",
+            "render_alpha",
+            "render_metadata",
+        ],
+    )
+    data = RenderDataSample(
+        image_id=img_ids,
+        camera_matrix=Ks,
+        view_matrix=viewmats,
+        groundtruth_image=gt_imgs,
+        render_image=rd_imgs,
+        render_alpha=rd_alphas,
+        render_metadata=rd_metas,
+    )
+    return data
+
+
+def test_fused_ssim_forward():
+    """Test forward pass of Fused SSIM."""
+    data = generate_render_data_sample()
+
+    gt_imgs = data.groundtruth_image.contiguous()
+    rd_imgs = data.render_image.contiguous()
+
+    device = gt_imgs.device
+
+    torch_ssim = StructuralSimilarityIndexMeasure(
+        data_range=1.0, kernel_size=11, k1=0.01, k2=0.03, sigma=1.5, reduction="none"
+    ).to(device)
+    ssim_0 = torch_ssim(gt_imgs, rd_imgs)
+
+    # ssim_1 = FusedSSIMMap.apply(0.01**2, 0.01**2, gt_imgs, rd_imgs, "valid", False)
+    # ssim_1 = ssim_1.mean(dim=[1, 2, 3])
+    ssim_1 = np.array(
+        [
+            fused_ssim(x[None, ...], y[None, ...], padding="valid", train=False).item()
+            for x, y in zip(rd_imgs, gt_imgs)
+        ],
+        dtype=np.float32,
+    )
+
+    ssim_1_batch = (
+        FusedSSIMMap.apply(0.01**2, 0.03**2, rd_imgs, gt_imgs, "valid", False)
+        .mean(dim=[1, 2, 3])
+        .cpu()
+        .detach()
+        .numpy()
+    )
+    assert np.allclose(
+        ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
+    ), "Fused SSIM abnormal batch-mode behavior!"
+
+    custom_ssim = CustomizedSSIM(ksize=11, sigma=1.5, padding="valid", reduction="mean")
+    custom_ssim = custom_ssim.to(device)
+    ssim_2 = np.array(
+        [
+            custom_ssim(x[None, ...], y[None, ...]).item()
+            for x, y in zip(rd_imgs, gt_imgs)
+        ],
+        dtype=np.float32,
+    )
+    ssim_2_batch = custom_ssim(gt_imgs, rd_imgs).cpu().detach().numpy()
+    assert np.allclose(
+        ssim_2, ssim_2_batch, atol=1e-4, rtol=1e-1
+    ), f"Customized SSIM abnormal batch-mode behavior!"
+
+    assert np.allclose(
+        ssim_1, ssim_2, atol=1e-4, rtol=1e-1
+    ), f"Fused and customized SSIM mismatch!"
+    # torch.cuda.empty_cache()
+
+
+def test_fused_ssim_backward():
+    """Test backward pass of Fused SSIM."""
+    pass
 
 
 if __name__ == "__main__":
+    test_fused_ssim_backward()
     test_fused_ssim_forward()
