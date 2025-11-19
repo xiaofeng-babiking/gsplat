@@ -213,8 +213,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         """
         super().__init__(params, defaults)
 
+    @staticmethod
     def _jacobian_l2_to_rgb(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
     ):
@@ -243,8 +243,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         jacob = factor * (rd_imgs - gt_imgs)
         return jacob
 
+    @staticmethod
     def _hessian_l2_to_rgb(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: Optional[torch.FloatTensor] = None,
     ):
@@ -284,8 +284,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         hess = hess.view(1, c, c, 1, 1).repeat(n, 1, 1, h, w)
         return hess
 
+    @staticmethod
     def _jacobian_ssim_to_rgb(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
         c1: float = 0.01**2,
@@ -450,7 +450,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
                 )
                 jacob_i_j[:, :, mask] = 0.0
-                
+
                 jacob += jacob_i_j
                 # torch.cuda.empty_cache()
 
@@ -461,24 +461,24 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
         return jacob
 
+    @staticmethod
     def _hessian_ssim_to_rgb(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
     ):
         """Computes Hessian matrix from SSIM to rendering RGB pixels."""
         n, c, h, w = rd_imgs.shape
 
+    @staticmethod
     def _jacobian_rgb_to_position(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
     ):
         """Computes Jacobian matrix from RGB to splats' positions."""
         n, c, h, w = rd_imgs.shape
 
+    @staticmethod
     def _hessian_rgb_to_position(
-        self,
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
     ):

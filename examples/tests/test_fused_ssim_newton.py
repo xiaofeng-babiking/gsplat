@@ -230,11 +230,14 @@ def test_fused_ssim_backward():
     data = generate_render_data_sample()
 
     gt_imgs = data.groundtruth_image.contiguous()
-    rd_imgs = torch.nn.Parameter(data.render_image.contiguous())
+    rd_imgs = data.render_image.contiguous()
+    rd_imgs.requires_grad = True
 
     device = gt_imgs.device
 
     ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="valid")
+    ssim_loss.require_grad = True
+
     start = time.time()
     ssim_loss.backward()
     end = time.time()
@@ -245,16 +248,9 @@ def test_fused_ssim_backward():
     rd_imgs.requires_grad = False
     torch.cuda.empty_cache()
 
-    dummy_params = torch.nn.Parameter(
-        torch.tensor([0.0], dtype=torch.float32),
-    )
-    group_optimizer = GSGroupNewtonOptimizer(
-        params=[dummy_params],
-        defaults={},
-    )
     gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
-    group_jacob = group_optimizer._jacobian_ssim_to_rgb(
+    group_jacob = GSGroupNewtonOptimizer._jacobian_ssim_to_rgb(
         rd_imgs,
         gt_imgs,
         gauss_filter_1d=gauss_filter_1d,
