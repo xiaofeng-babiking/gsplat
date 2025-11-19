@@ -36,6 +36,7 @@ class GSGroupSSIMLoss(_Loss):
         self._c2 = c2
         self._padding = padding
         self._filter = gauss_filter_1d
+        self._reduction = reduction
         super().__init__(size_average, reduce, reduction, *args, **kwargs)
 
         self._kernel = torch.nn.Parameter(
@@ -170,11 +171,11 @@ class GSGroupSSIMLoss(_Loss):
         if self._padding == "valid":
             ssim_map = ssim_map[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize]
 
-        if self.reduction == "mean":
+        if self._reduction == "mean":
             ssim_score = torch.mean(ssim_map, dim=[1, 2, 3])
-        elif self.reduction == "sum":
+        elif self._reduction == "sum":
             ssim_score = torch.sum(ssim_map, dim=[1, 2, 3])
-        elif self.reduction == "none":
+        elif self._reduction == "none":
             ssim_score = ssim_map
         else:
             raise ValueError(f"Invalid reduction mode: {self._reduction}!")
@@ -203,3 +204,35 @@ class GSGroupNewton(torch.optim.Optimizer):
                     ]
         """
         super().__init__(params, defaults)
+
+    def _jacobian_l2_to_rgb(
+        self,
+        src_imgs: torch.FloatTensor,
+        dst_imgs: torch.FloatTensor,
+    ):
+        """Computes Jacobian matrix from L2 to rendering pixel space."""
+        n, c, h, w = src_imgs.shape
+
+    def _hessian_l2_to_rgb(
+        self,
+        src_imgs: torch.FloatTensor,
+        dst_imgs: torch.FloatTensor,
+    ):
+        """Computes Hessian matrix from L2 to rendering pixel space."""
+        n, c, h, w = src_imgs.shape
+
+    def _jacobian_rgb_to_position(
+        self,
+        src_imgs: torch.FloatTensor,
+        dst_imgs: torch.FloatTensor,
+    ):
+        """Computes Jacobian matrix from RGB to position space."""
+        n, c, h, w = src_imgs.shape
+
+    def _hessian_rgb_to_position(
+        self,
+        src_imgs: torch.FloatTensor,
+        dst_imgs: torch.FloatTensor,
+    ):
+        """Computes Hessian matrix from RGB to position space."""
+        n, c, h, w = src_imgs.shape
