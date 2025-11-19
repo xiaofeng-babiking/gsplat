@@ -14,7 +14,7 @@ from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization
 from gsplat.logger import create_logger
-from gsplat.optimizers.sparse_newton import GSGroupSSIMLoss
+from gsplat.optimizers.sparse_newton import GroupSSIMLoss
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 
@@ -190,7 +190,7 @@ def test_fused_ssim_forward():
         ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
     ), "Fused SSIM abnormal batch-mode behavior!"
 
-    group_ssim = GSGroupSSIMLoss(
+    group_ssim = GroupSSIMLoss(
         gauss_filter_1d=parse_fused_ssim_gauss_filter_1d(),
         c1=0.01**2,
         c2=0.03**2,
