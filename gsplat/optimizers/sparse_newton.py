@@ -404,9 +404,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         half_ksize = ksize // 2
         kernel = group_ssim._kernel.data.clone().detach().squeeze()
 
-        del group_ssim
-        torch.cuda.empty_cache()
-
         # m, n dimension = [H, W]
         m, n = torch.meshgrid(torch.arange(w), torch.arange(h), indexing="xy")
         m, n = m.to(device), n.to(device)
@@ -420,9 +417,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         # f3 = (c2 + σ + σ')
         f_3 = c2 + rd_vars + gt_vars
 
-        del rd_vars, gt_vars, rd_gt_covars
-        torch.cuda.empty_cache()
-
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
         jacob = torch.zeros_like(rd_imgs)
         for i in range(ksize):
@@ -430,49 +424,34 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                 a = m + i - half_ksize
                 b = n + j - half_ksize
                 mask = (a < 0) | (a >= w) | (b < 0) | (b >= h)
-                mask = mask[None, None, ...].float()
 
                 a = torch.clamp(a, min=0, max=w - 1)
                 b = torch.clamp(b, min=0, max=h - 1)
 
                 rd_means_a_b = rd_means[..., b, a]
                 gt_means_a_b = gt_means[..., b, a]
-                del a, b
-                torch.cuda.empty_cache()
 
                 # g0 = 2.0 * μ'(a, b) * W(i, j)
-                jacob += (f_1 / f_2 / f_3) * (2.0 * gt_means_a_b * kernel[i, j]) * mask
+                g_0 = 2.0 * gt_means_a_b * kernel[i, j]
 
                 # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
-                jacob += (
-                    (f_0 / f_2 / f_3)
-                    * (2.0 * (gt_imgs - gt_means_a_b) * kernel[i, j])
-                    * mask
-                )
-                del gt_means_a_b
-                torch.cuda.empty_cache()
+                g_1 = 2.0 * (gt_imgs - gt_means_a_b) * kernel[i, j]
 
                 # g2 = 2.0 * μ(a, b) * W(i, j)
-                jacob -= (
-                    (f_0 * f_1 / (f_2**2) / f_3)
-                    * (2.0 * rd_means_a_b * kernel[i, j])
-                    * mask
-                )
+                g_2 = 2.0 * rd_means_a_b * kernel[i, j]
 
                 # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
-                jacob -= (
-                    (f_0 * f_1 / f_2 / (f_3**2) + eps)
-                    * (2.0 * (rd_imgs - rd_means_a_b) * kernel[i, j])
-                    * mask
-                )
-                del rd_means_a_b
-                del mask
-                torch.cuda.empty_cache()
+                g_3 = 2.0 * (rd_imgs - rd_means_a_b) * kernel[i, j]
 
-        del kernel
-        del m, n
-        del f_0, f_1, f_2, f_3
-        torch.cuda.empty_cache()
+                jacob_i_j = (
+                    (f_1 / f_2 / f_3) * g_0
+                    + (f_0 / f_2 / f_3) * g_1
+                    - (f_0 * f_1 / (f_2**2) / f_3) * g_2
+                    - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
+                ) * mask[None, None, ...].float()
+                
+                jacob += jacob_i_j
+                # torch.cuda.empty_cache()
 
         # SSIMLoss = (1.0 - SSIMScore)
         jacob *= -factor

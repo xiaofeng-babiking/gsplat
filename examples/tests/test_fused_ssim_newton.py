@@ -234,38 +234,37 @@ def test_fused_ssim_backward():
 
     device = gt_imgs.device
 
-    group_optimizer = GSGroupNewtonOptimizer(params=[rd_imgs], defaults={})
-    group_ssim = GroupSSIMLoss(
-        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
-        c1=0.01**2,
-        c2=0.03**2,
-        padding="valid",
-        reduction="mean",
-    )
-    ssim_loss = group_ssim(rd_imgs, gt_imgs).mean()
+    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="valid")
     start = time.time()
     ssim_loss.backward()
     end = time.time()
     LOGGER.info(f"Pytorch Numerical Backward-Propagate time: {end - start:.6f} second.")
     torch_jacob = rd_imgs.grad.clone().cpu().detach().numpy()
+
+    rd_imgs = rd_imgs.data.clone().detach()
+    rd_imgs.requires_grad = False
     torch.cuda.empty_cache()
 
+    dummy_params = torch.nn.Parameter(
+        torch.tensor([0.0], dtype=torch.float32),
+    )
+    group_optimizer = GSGroupNewtonOptimizer(
+        params=[dummy_params],
+        defaults={},
+    )
+    gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
-    group_jacob = (
-        group_optimizer._jacobian_ssim_to_rgb(
-            rd_imgs,
-            gt_imgs,
-            gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
-        )
-        .cpu()
-        .detach()
-        .numpy()
+    group_jacob = group_optimizer._jacobian_ssim_to_rgb(
+        rd_imgs,
+        gt_imgs,
+        gauss_filter_1d=gauss_filter_1d,
     )
     end = time.time()
     LOGGER.info(f"GroupSSIM Analytic Backward-Compute time: {end - start:.6f} second.")
-    torch.cuda.empty_cache()
+    group_jacob = group_jacob.cpu().detach().numpy()
 
     assert np.allclose(torch_jacob, group_jacob, atol=1e-4, rtol=1e-1)
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
