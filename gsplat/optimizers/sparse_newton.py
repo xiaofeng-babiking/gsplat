@@ -448,7 +448,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     + (f_0 / f_2 / f_3) * g_1
                     - (f_0 * f_1 / (f_2**2) / f_3) * g_2
                     - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
-                ) * mask[None, None, ...].float()
+                )
+                jacob_i_j[:, :, mask] = 0.0
                 
                 jacob += jacob_i_j
                 # torch.cuda.empty_cache()
