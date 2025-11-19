@@ -31,9 +31,7 @@ class GroupSSIMLoss(_Loss):
         self._reduction = reduction
         super().__init__(size_average, reduce, reduction, *args, **kwargs)
 
-        self._kernel = torch.nn.Parameter(
-            self.create_gauss_kernel_2d(), requires_grad=False
-        )
+        self._kernel = self.create_gauss_kernel_2d()
 
     def create_gauss_kernel_2d(self) -> torch.FloatTensor:
         """Create 2D Gaussian Kernel for SSIM convolution."""
@@ -194,7 +192,7 @@ class GSParameterGroup(Enum):
     COLOR = 4  # Spherical Harmonic coefficients Dimension = (L + 1)^2
 
 
-class GSGroupNewton(torch.optim.Optimizer):
+class GSGroupNewtonOptimizer(torch.optim.Optimizer):
     def __init__(
         self,
         params: Iterable[Dict[str, Any]],
@@ -296,6 +294,7 @@ class GSGroupNewton(torch.optim.Optimizer):
         sigma: float = 1.5,
         padding: Literal["valid", "same"] = "valid",
         gauss_filter_1d: Optional[torch.FloatTensor] = None,
+        eps: float = 1e-12,
     ):
         """Computes Jacobian matrix from SSIM to rendering RGB pixels.
 
@@ -327,7 +326,7 @@ class GSGroupNewton(torch.optim.Optimizer):
                         i=kW - 1,  j=kH - 1,  P(m, n) -> left-top corner of the kernel
                         i=kW // 2, j=kH // 2, P(m, n) -> center of the kernel
                     for example,
-                    Let (a, b, R) = (m + i - kW // 2, n + j - kH // 2)
+                    Let (a, b) = (m + i - kW // 2, n + j - kH // 2)
                     then,
                         fs(a, b, R) 
                             = (c1 + 2.0 * μ * μ') * (c2 + 2.0 * Σ) \
@@ -378,6 +377,8 @@ class GSGroupNewton(torch.optim.Optimizer):
         """
         n, c, h, w = rd_imgs.shape
 
+        device = rd_imgs.device
+
         factor = 1.0 / (n * c * h * w)
 
         group_ssim = GroupSSIMLoss(
@@ -387,7 +388,7 @@ class GSGroupNewton(torch.optim.Optimizer):
             c2=c2,
             padding=padding,
             gauss_filter_1d=gauss_filter_1d,
-        )
+        ).to(device)
 
         rd_means = group_ssim.compute_mean(rd_imgs)
         rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means)
@@ -401,16 +402,84 @@ class GSGroupNewton(torch.optim.Optimizer):
 
         ksize = group_ssim._kernel_size
         half_ksize = ksize // 2
-        kernel = group_ssim._kernel.data.clone().detach()
+        kernel = group_ssim._kernel.data.clone().detach().squeeze()
 
-        # TODO： CUDA kernel pixelwise parallel computation
+        del group_ssim
+        torch.cuda.empty_cache()
+
+        # m, n dimension = [H, W]
+        m, n = torch.meshgrid(torch.arange(w), torch.arange(h), indexing="xy")
+        m, n = m.to(device), n.to(device)
+
+        # f0 = (c1 + 2.0 * μ * μ')
+        f_0 = c1 + 2.0 * rd_means * gt_means
+        # f1 = (c2 + 2.0 * Σ)
+        f_1 = c2 + 2.0 * rd_gt_covars
+        # f2 = (c1 + μ ** 2 + μ' ** 2)
+        f_2 = c1 + rd_means**2 + gt_means**2
+        # f3 = (c2 + σ + σ')
+        f_3 = c2 + rd_vars + gt_vars
+
+        del rd_vars, gt_vars, rd_gt_covars
+        torch.cuda.empty_cache()
+
+        # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
         jacob = torch.zeros_like(rd_imgs)
+        for i in range(ksize):
+            for j in range(ksize):
+                a = m + i - half_ksize
+                b = n + j - half_ksize
+                mask = (a < 0) | (a >= w) | (b < 0) | (b >= h)
+                mask = mask[None, None, ...].float()
 
-        f_0 = 2.0 * rd_means * gt_means + c1
-        f_1 = 2.0 * rd_gt_covars + c2
-        f_2 = rd_means * gt_means + c1
+                a = torch.clamp(a, min=0, max=w - 1)
+                b = torch.clamp(b, min=0, max=h - 1)
 
-        m, n = torch.meshgrid(torch.arange(w), torch.arange(h), indexing="ij")
+                rd_means_a_b = rd_means[..., b, a]
+                gt_means_a_b = gt_means[..., b, a]
+                del a, b
+                torch.cuda.empty_cache()
+
+                # g0 = 2.0 * μ'(a, b) * W(i, j)
+                jacob += (f_1 / f_2 / f_3) * (2.0 * gt_means_a_b * kernel[i, j]) * mask
+
+                # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
+                jacob += (
+                    (f_0 / f_2 / f_3)
+                    * (2.0 * (gt_imgs - gt_means_a_b) * kernel[i, j])
+                    * mask
+                )
+                del gt_means_a_b
+                torch.cuda.empty_cache()
+
+                # g2 = 2.0 * μ(a, b) * W(i, j)
+                jacob -= (
+                    (f_0 * f_1 / (f_2**2) / f_3)
+                    * (2.0 * rd_means_a_b * kernel[i, j])
+                    * mask
+                )
+
+                # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
+                jacob -= (
+                    (f_0 * f_1 / f_2 / (f_3**2) + eps)
+                    * (2.0 * (rd_imgs - rd_means_a_b) * kernel[i, j])
+                    * mask
+                )
+                del rd_means_a_b
+                del mask
+                torch.cuda.empty_cache()
+
+        del kernel
+        del m, n
+        del f_0, f_1, f_2, f_3
+        torch.cuda.empty_cache()
+
+        # SSIMLoss = (1.0 - SSIMScore)
+        jacob *= -factor
+
+        if padding == "valid":
+            jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
+        return jacob
 
     def _hessian_ssim_to_rgb(
         self,

@@ -1,20 +1,22 @@
 import os
 import sys
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import re
+import time
 import torch
 import cv2 as cv
 import numpy as np
 from tqdm import tqdm
 from collections import namedtuple
-from typing import OrderedDict, Optional, Literal
+from typing import OrderedDict, Optional
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization
 from gsplat.logger import create_logger
-from gsplat.optimizers.sparse_newton import GroupSSIMLoss
+from gsplat.optimizers.sparse_newton import GroupSSIMLoss, GSGroupNewtonOptimizer
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 
@@ -125,7 +127,7 @@ def generate_render_data_sample():
         height=img_h,
         sh_degree=sh_deg,
     )
-    LOGGER.info(f"Finished rendering image-{img_id}.")
+    LOGGER.info(f"Finished rendering {n_imgs} images.")
 
     rd_imgs = torch.permute(rd_imgs, dims=[0, 3, 1, 2])
     rd_imgs = torch.clamp(rd_imgs, min=0.0, max=1.0)
@@ -179,6 +181,7 @@ def test_fused_ssim_forward():
         dtype=np.float32,
     )
 
+    start = time.time()
     ssim_1_batch = (
         FusedSSIMMap.apply(0.01**2, 0.03**2, rd_imgs, gt_imgs, "valid", False)
         .mean(dim=[1, 2, 3])
@@ -186,12 +189,14 @@ def test_fused_ssim_forward():
         .detach()
         .numpy()
     )
+    end = time.time()
+    LOGGER.info(f"Fused SSIM batch-mode Forward-Pass time: {end - start:.6f} second.")
     assert np.allclose(
         ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
     ), "Fused SSIM abnormal batch-mode behavior!"
 
     group_ssim = GroupSSIMLoss(
-        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d(),
+        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
         c1=0.01**2,
         c2=0.03**2,
         padding="valid",
@@ -205,21 +210,62 @@ def test_fused_ssim_forward():
         ],
         dtype=np.float32,
     )
+    start = time.time()
     ssim_2_batch = group_ssim(gt_imgs, rd_imgs).cpu().detach().numpy()
+    end = time.time()
+    LOGGER.info(f"GroupSSIM batch-mode Forward-Pass time: {end - start:.6f} second.")
     assert np.allclose(
         ssim_2, ssim_2_batch, atol=1e-4, rtol=1e-1
-    ), f"Customized SSIM abnormal batch-mode behavior!"
+    ), f"GroupSSIM abnormal batch-mode behavior!"
 
     assert np.allclose(
         ssim_1, 1.0 - ssim_2, atol=1e-4, rtol=1e-1
-    ), f"Fused and customized SSIM mismatch!"
+    ), f"Fused and Group SSIM mismatch!"
 
     torch.cuda.empty_cache()
 
 
 def test_fused_ssim_backward():
     """Test backward pass of Fused SSIM."""
-    pass
+    data = generate_render_data_sample()
+
+    gt_imgs = data.groundtruth_image.contiguous()
+    rd_imgs = torch.nn.Parameter(data.render_image.contiguous())
+
+    device = gt_imgs.device
+
+    group_optimizer = GSGroupNewtonOptimizer(params=[rd_imgs], defaults={})
+    group_ssim = GroupSSIMLoss(
+        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
+        c1=0.01**2,
+        c2=0.03**2,
+        padding="valid",
+        reduction="mean",
+    )
+    ssim_loss = group_ssim(rd_imgs, gt_imgs).mean()
+    start = time.time()
+    ssim_loss.backward()
+    end = time.time()
+    LOGGER.info(f"Pytorch Numerical Backward-Propagate time: {end - start:.6f} second.")
+    torch_jacob = rd_imgs.grad.clone().cpu().detach().numpy()
+    torch.cuda.empty_cache()
+
+    start = time.time()
+    group_jacob = (
+        group_optimizer._jacobian_ssim_to_rgb(
+            rd_imgs,
+            gt_imgs,
+            gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
+        )
+        .cpu()
+        .detach()
+        .numpy()
+    )
+    end = time.time()
+    LOGGER.info(f"GroupSSIM Analytic Backward-Compute time: {end - start:.6f} second.")
+    torch.cuda.empty_cache()
+
+    assert np.allclose(torch_jacob, group_jacob, atol=1e-4, rtol=1e-1)
 
 
 if __name__ == "__main__":
