@@ -8,13 +8,13 @@ import torch
 import cv2 as cv
 import numpy as np
 from tqdm import tqdm
-from scipy.optimize import curve_fit
 from collections import namedtuple
-from typing import OrderedDict, List, Literal
+from typing import OrderedDict, Optional, Literal
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization
 from gsplat.logger import create_logger
+from gsplat.optimizers.sparse_newton import GSGroupSSIMLoss
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 
@@ -30,48 +30,9 @@ LOGGER = create_logger(
 )
 
 
-def fit_fused_ssim_gaussian_distribution(xdata: np.ndarray, ydata: np.ndarray):
-    """Fit Gaussian Distribution sigma from fused-ssim."""
-
-    gauss_filter_1d = lambda x, mu, sigma: (
-        1.0
-        / (np.sqrt(2 * np.pi * sigma**2))
-        * np.exp(-((x - mu) ** 2) / (2 * sigma**2))
-    )
-
-    popt, _ = curve_fit(gauss_filter_1d, xdata=xdata, ydata=ydata)
-
-    opt_mu, opt_sigma = popt
-    return opt_mu, opt_sigma
-
-
-class CustomizedSSIM(torch.nn.Module):
-    def __init__(
-        self,
-        ksize: int = 11,
-        sigma=1.5,
-        c1=0.01**2,
-        c2=0.03**2,
-        padding: Literal["valid", "same"] = "valid",
-        reduction: Literal["mean", "sum", "none"] = "mean",
-        *args,
-        **kwargs,
-    ) -> None:
-        """Customized SSIM module initialization."""
-        super().__init__(*args, **kwargs)
-        self._ksize = ksize
-        self._sigma = sigma
-        self._c1 = c1
-        self._c2 = c2
-        self._padding = padding
-        self._reduction = reduction
-
-        self._kernel = torch.nn.Parameter(
-            self.create_gaussian_kernel(), requires_grad=False
-        )
-
-    def create_gaussian_kernel(self) -> torch.FloatTensor:
-        """Create a gaussian filter."""
+def parse_fused_ssim_gauss_filter_1d(marco_str: Optional[str] = None):
+    """ "Parse Gaussian filter 1D from fused-ssim macro string."""
+    if marco_str is None:
         marco_str = """
             #define G_00 0.001028380123898387f
             #define G_01 0.0075987582094967365f
@@ -85,96 +46,11 @@ class CustomizedSSIM(torch.nn.Module):
             #define G_09 0.0075987582094967365f
             #define G_10 0.001028380123898387f
         """
-        pattern = re.compile(r"#define\s+G_([0-9]+)\s+(.*)f", re.MULTILINE)
-        matches = [(int(i), float(x)) for i, x in pattern.findall(marco_str.strip())]
+    pattern = re.compile(r"#define\s+G_([0-9]+)\s+(.*)f", re.MULTILINE)
+    matches = [(int(i), float(x)) for i, x in pattern.findall(marco_str.strip())]
 
-        gauss_1d = torch.tensor([x for _, x in sorted(matches)], dtype=torch.float32)
-        kernel = gauss_1d.reshape(-1, 1) * gauss_1d.reshape(1, -1)
-        return kernel[None, None, ...]
-
-    def forward(
-        self, src_img: torch.FloatTensor, dst_img: torch.FloatTensor
-    ) -> torch.FloatTensor:
-        """Compute SSIM between two images.
-
-        Args:
-            [1] src_img: torch.FloatTensor, source image, NCHW format.
-            [2] dst_img: torch.FloatTensor, target image, NCHW format.
-
-        Return:
-            [1] ssim: torch.FloatTensor, SSIM score between two images.
-        """
-        assert (
-            src_img.shape == dst_img.shape
-        ), "source and target image must have the same shape!"
-
-        groups = src_img.shape[1]
-
-        src_mean = torch.conv2d(
-            src_img,
-            torch.tile(self._kernel, (groups, 1, 1, 1)),
-            stride=1,
-            padding="same",
-            groups=groups,
-        )
-        dst_mean = torch.conv2d(
-            dst_img,
-            torch.tile(self._kernel, (groups, 1, 1, 1)),
-            stride=1,
-            padding="same",
-            groups=groups,
-        )
-
-        src_var = (
-            torch.conv2d(
-                src_img**2,
-                torch.tile(self._kernel, (groups, 1, 1, 1)),
-                stride=1,
-                padding="same",
-                groups=groups,
-            )
-            - src_mean**2
-        )
-        dst_var = (
-            torch.conv2d(
-                dst_img**2,
-                torch.tile(self._kernel, (groups, 1, 1, 1)),
-                stride=1,
-                padding="same",
-                groups=groups,
-            )
-            - dst_mean**2
-        )
-        src_dst_covar = (
-            torch.conv2d(
-                src_img * dst_img,
-                torch.tile(self._kernel, (groups, 1, 1, 1)),
-                stride=1,
-                padding="same",
-                groups=groups,
-            )
-            - src_mean * dst_mean
-        )
-
-        a = self._c1 + src_mean**2 + dst_mean**2
-        b = self._c2 + src_var + dst_var
-        c = self._c1 + 2.0 * src_mean * dst_mean
-        d = self._c2 + 2.0 * src_dst_covar
-        ssim_map = (c * d) / (a * b)
-
-        half_ksize = self._ksize // 2
-        if self._padding == "valid":
-            ssim_map = ssim_map[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize]
-
-        if self._reduction == "mean":
-            ssim_score = torch.mean(ssim_map, dim=[1, 2, 3])
-        elif self._reduction == "sum":
-            ssim_score = torch.sum(ssim_map, dim=[1, 2, 3])
-        elif self._reduction == "none":
-            ssim_score = ssim_map
-        else:
-            raise ValueError(f"Invalid reduction mode: {self._reduction}!")
-        return ssim_score
+    filter_1d = torch.tensor([x for _, x in sorted(matches)], dtype=torch.float32)
+    return filter_1d
 
 
 def generate_render_data_sample():
@@ -291,6 +167,7 @@ def test_fused_ssim_forward():
         data_range=1.0, kernel_size=11, k1=0.01, k2=0.03, sigma=1.5, reduction="none"
     ).to(device)
     ssim_0 = torch_ssim(gt_imgs, rd_imgs)
+    LOGGER.info(f"Metrics average SSIM score: {ssim_0.mean():.4f}.")
 
     # ssim_1 = FusedSSIMMap.apply(0.01**2, 0.01**2, gt_imgs, rd_imgs, "valid", False)
     # ssim_1 = ssim_1.mean(dim=[1, 2, 3])
@@ -313,24 +190,31 @@ def test_fused_ssim_forward():
         ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
     ), "Fused SSIM abnormal batch-mode behavior!"
 
-    custom_ssim = CustomizedSSIM(ksize=11, sigma=1.5, padding="valid", reduction="mean")
-    custom_ssim = custom_ssim.to(device)
+    group_ssim = GSGroupSSIMLoss(
+        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d(),
+        c1=0.01**2,
+        c2=0.03**2,
+        padding="valid",
+        reduction="mean",
+    )
+    group_ssim = group_ssim.to(device)
     ssim_2 = np.array(
         [
-            custom_ssim(x[None, ...], y[None, ...]).item()
+            group_ssim(x[None, ...], y[None, ...]).item()
             for x, y in zip(rd_imgs, gt_imgs)
         ],
         dtype=np.float32,
     )
-    ssim_2_batch = custom_ssim(gt_imgs, rd_imgs).cpu().detach().numpy()
+    ssim_2_batch = group_ssim(gt_imgs, rd_imgs).cpu().detach().numpy()
     assert np.allclose(
         ssim_2, ssim_2_batch, atol=1e-4, rtol=1e-1
     ), f"Customized SSIM abnormal batch-mode behavior!"
 
     assert np.allclose(
-        ssim_1, ssim_2, atol=1e-4, rtol=1e-1
+        ssim_1, 1.0 - ssim_2, atol=1e-4, rtol=1e-1
     ), f"Fused and customized SSIM mismatch!"
-    # torch.cuda.empty_cache()
+
+    torch.cuda.empty_cache()
 
 
 def test_fused_ssim_backward():
@@ -339,5 +223,5 @@ def test_fused_ssim_backward():
 
 
 if __name__ == "__main__":
-    test_fused_ssim_backward()
     test_fused_ssim_forward()
+    test_fused_ssim_backward()
