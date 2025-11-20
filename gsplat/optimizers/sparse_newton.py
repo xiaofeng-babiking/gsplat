@@ -109,27 +109,27 @@ class GroupSSIMLoss(_Loss):
 
     def compute_covariance(
         self,
-        img_0: torch.FloatTensor,
+        img0: torch.FloatTensor,
         mean_0: Optional[torch.FloatTensor] = None,
-        img_1: Optional[torch.FloatTensor] = None,
+        img1: Optional[torch.FloatTensor] = None,
         mean_1: Optional[torch.FloatTensor] = None,
     ):
         """Compute covariance between two images."""
-        if img_1 is not None:
+        if img1 is not None:
             assert (
-                img_0.shape == img_1.shape
+                img0.shape == img1.shape
             ), "Source and target image must have the same shape!"
 
-        c = img_0.shape[1]
+        c = img0.shape[1]
 
         if mean_0 is None:
-            mean_0 = self.compute_mean(img_0)
+            mean_0 = self.compute_mean(img0)
 
-        if img_1 is not None and mean_1 is None:
-            mean_1 = self.compute_mean(img_1)
+        if img1 is not None and mean_1 is None:
+            mean_1 = self.compute_mean(img1)
 
         # No need to compute target mean when targe image is None
-        mean_1 = None if img_1 is None else mean_1
+        mean_1 = None if img1 is None else mean_1
 
         if mean_1 is not None:
             assert (
@@ -137,12 +137,12 @@ class GroupSSIMLoss(_Loss):
             ), "Mean tensors must have the same shape!"
 
         covar = torch.conv2d(
-            (img_0 * img_1) if img_1 is not None else (img_0**2),
+            (img0 * img1) if img1 is not None else (img0**2),
             torch.tile(self._kernel, (c, 1, 1, 1)),
             stride=1,
             padding="same",
             groups=c,
-        ) - ((mean_0 * mean_1) if img_1 is not None else (mean_0**2))
+        ) - ((mean_0 * mean_1) if img1 is not None else (mean_0**2))
         return covar
 
     def forward(
@@ -364,6 +364,42 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                        = 2.0 * W(m, n) * R(m, n) - 2.0 * μ * ∂μ(a, b) / R(m, n)
                        = 2.0 * W(m, n) * R(m, n) - 2.0 * μ * ∂μ(a, b) / R(m, n)
                        = 2.0 * W(m, n) * (R(m, n) - μ)
+                    
+                    jacobian = 
+                        f1 / f2f3 * g0
+                        + f0 / f2f3 * g1
+                        - f0f1 / f2²f3 * g2
+                        - f0f1 / f2f3² * g3
+            [2] hess: Hessian matrix from SSIM to rendering RGB pixels, Dim=[N, C, C, H, W], torch.FloatTensor.
+                    h0 = ∂g0 / ∂R(m, n) = 0
+                    h1 = ∂g1 / ∂R(m, n) = 0
+                    h2 = ∂g2 / ∂R(m, n) = 0
+                    h3 = ∂g3 / ∂R(m, n) = 2.0 * W(m, n)
+
+                    ∂ (f1 / f2f3 * g0) / ∂R(m, n)
+                    = (f1 / f2f3 * g0)'
+                    = (f1 / f2f3)' * g0 + (f1 / f2f3) * h0
+                    = (g1 / f2f3 - f1 * (f2f3)' / f2²f3²) * g0
+                    = (g1 / f2f3 - f1 * (g2f3 + f2g3) / f2²f3²) * g0
+
+                    ∂ (f0 / f2f3 * g1) / ∂R(m, n)
+                    = (f0 / f2f3 * g1)'
+                    = (f0 / f2f3)' * g1 + (f0 / f2f3) * h1
+                    = (g0 / f2f3 - f0 * (f2f3)' / f2²f3²) * g1
+                    = (g0 / f2f3 - f0 * (g2f3 + f2g3) / f2²f3²) * g1
+
+                    ∂ (f0f1 / f2²f3 * g2) / ∂R(m, n)
+                    = (f0f1 / f2²f3 * g2)'
+                    = (f0f1 / f2²f3)' * g2 + (f0f1 / f2²f3) * h2
+                    = (（f0f1）' / f2²f3 - f0f1 * (f2²f3)' / f2⁴f3²) * g2
+                    = ((g0f1 + f0g1) / f2²f3 - f0f1 * (2*f2f3g2 + f2²g3) / (f2²f3)²) * g2
+                    
+                    ∂(f0f1 / f2f3² * g3) / ∂R(m, n)
+                    = (f0f1 / f2f3² * g3)'
+                    = (f0f1 / f2f3²)' * g3 + (f0f1 / f2f3²) * h3
+                    = ((f0f1)' / f2f3² - f0f1 * (f2f3²)' / (f2f3²)²) * g3 + (f0f1 / f2f3²) * h3
+                    = ((g0f1 + f0g1) / f2f3² - f0f1 * (g2f3² + 2*f2f3g3) / (f2f3²)²) * g3 + (f0f1 / f2f3²) * h3
+
         """
         nb, nc, h, w = rd_imgs.shape
 
@@ -380,85 +416,54 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             gauss_filter_1d=gauss_filter_1d,
         ).to(device)
 
-        rd_means = group_ssim.compute_mean(rd_imgs)
-        gt_means = group_ssim.compute_mean(gt_imgs)
-
         ksize = group_ssim._kernel_size
         half_ksize = ksize // 2
-        kernel = group_ssim._kernel.data.clone().detach().to(device)
 
-        # m, n dimension = [H*W, 1]
-        m, n = torch.meshgrid(torch.arange(w), torch.arange(h), indexing="xy")
-        m, n = m.flatten().to(device)[:, None], n.flatten().to(device)[:, None]
-
-        # i, j dimension = [1, kH*kW]
-        i, j = torch.meshgrid(torch.arange(ksize), torch.arange(ksize), indexing="xy")
-        i, j = i.flatten().to(device)[None, :], j.flatten().to(device)[None, :]
-
-        # a, b dimension = [H*W， kH*KW]
-        a = m + i - half_ksize
-        b = n + j - half_ksize
-
-        mask = (a < 0) | (a >= w) | (b < 0) | (b >= h)
-        mask = mask[None, None, ...].float()
-
-        kernel = kernel.reshape([1, 1, 1, ksize**2])
-        kernel = kernel * mask
-
-        del m, n, i, j, mask
-        torch.cuda.empty_cache()
-
-        a = torch.clamp(a, min=0, max=w - 1)
-        b = torch.clamp(b, min=0, max=h - 1)
-
-        reduce_and_reshape = lambda x: torch.sum(x, dim=-1).reshape(
-            shape=[nb, nc, h, w]
-        )
-
-        # g0 = 2.0 * μ'(a, b) * W(i, j)
-        g_0 = reduce_and_reshape(2.0 * gt_means[..., b, a] * kernel)
-
-        # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
-        g_1 = reduce_and_reshape(
-            2.0 * (gt_imgs.reshape([nb, nc, h * w, 1]) - gt_means[..., b, a]) * kernel
-        )
-
-        # g2 = 2.0 * μ(a, b) * W(i, j)
-        g_2 = reduce_and_reshape(2.0 * rd_means[..., b, a] * kernel)
-
-        # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
-        g_3 = reduce_and_reshape(
-            2.0 * (rd_imgs.reshape([nb, nc, h * w, 1]) - rd_means[..., b, a]) * kernel
-        )
-
+        rd_means = group_ssim.compute_mean(rd_imgs)
+        gt_means = group_ssim.compute_mean(gt_imgs)
         rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means)
         gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means)
         rd_gt_covars = group_ssim.compute_covariance(
             rd_imgs, rd_means, gt_imgs, gt_means
         )
-
         # f0 = (c1 + 2.0 * μ * μ')
-        f_0 = c1 + 2.0 * rd_means * gt_means
+        f0 = c1 + 2.0 * rd_means * gt_means
         # f1 = (c2 + 2.0 * Σ)
-        f_1 = c2 + 2.0 * rd_gt_covars
+        f1 = c2 + 2.0 * rd_gt_covars
         # f2 = (c1 + μ ** 2 + μ' ** 2)
-        f_2 = c1 + rd_means**2 + gt_means**2
+        f2 = c1 + rd_means**2 + gt_means**2
         # f3 = (c2 + σ + σ')
-        f_3 = c2 + rd_vars + gt_vars
+        f3 = c2 + rd_vars + gt_vars
 
-        del rd_means, gt_means, rd_vars, gt_vars, rd_gt_covars
+        del rd_vars, gt_vars, rd_gt_covars
+        torch.cuda.empty_cache()
+
+        # g0 = 2.0 * μ'(a, b) * W(i, j)
+        #    = 2.0 * μ'(m + i - kW // 2 , n + j - kH // 2) * W(i, j)
+        g0 = 2.0 * group_ssim.compute_mean(gt_means)
+
+        # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
+        #    = 2.0 * W(i, j) * R'(m, n) - g0
+        #    = 2.0 * W(i, j) * R'(m, n)
+        #    = 2.0 * constant * R'(m, n) - g0
+        g1 = 2.0 * torch.sum(group_ssim._kernel) * gt_imgs - g0
+
+        # g2 = 2.0 * μ(a, b) * W(i, j)
+        g2 = 2.0 * group_ssim.compute_mean(rd_means)
+
+        # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
+        g3 = 2.0 * torch.sum(group_ssim._kernel) * rd_imgs - g2
+
+        del rd_means, gt_means
         torch.cuda.empty_cache()
 
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
         jacob = (
-            (f_1 / f_2 / f_3) * g_0
-            + (f_0 / f_2 / f_3) * g_1
-            - (f_0 * f_1 / (f_2**2) / f_3) * g_2
-            - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
+            (f1 / f2 / f3) * g0
+            + (f0 / f2 / f3) * g1
+            - (f0 * f1 / (f2**2) / f3) * g2
+            - (f0 * f1 / f2 / (f3**2)) * g3
         )
-
-        del f_0, f_1, f_2, f_3
-        del g_0, g_1, g_2, g_3
         torch.cuda.empty_cache()
 
         # SSIMLoss = (1.0 - SSIMScore)

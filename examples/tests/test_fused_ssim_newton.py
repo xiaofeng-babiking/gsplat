@@ -254,19 +254,13 @@ def test_fused_ssim_backward():
     torch.cuda.empty_cache()
 
     gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
-    n_imgs = len(rd_imgs)
-    step = 8
     start = time.time()
-    group_jacob = [
-        GSGroupNewtonOptimizer._backward_ssim_to_rgb(
-            rd_imgs[i : min(i + step, n_imgs), ...],
-            gt_imgs[i : min(i + step, n_imgs), ...],
-            gauss_filter_1d=gauss_filter_1d,
-            with_hessian=False,
-        )[0]
-        for i in range(0, len(rd_imgs), step)
-    ]
-    group_jacob = torch.cat(group_jacob, dim=0)
+    group_jacob = GSGroupNewtonOptimizer._backward_ssim_to_rgb(
+        rd_imgs,
+        gt_imgs,
+        gauss_filter_1d=gauss_filter_1d,
+        with_hessian=False,
+    )[0]
     end = time.time()
     group_elapsed = float(end - start)
     group_jacob = group_jacob.cpu().detach().numpy()
