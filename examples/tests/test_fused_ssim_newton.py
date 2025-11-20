@@ -255,13 +255,14 @@ def test_fused_ssim_backward():
 
     gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
-    group_jacob = GSGroupNewtonOptimizer._backward_ssim_to_rgb(
+    group_jacob, group_hess = GSGroupNewtonOptimizer._backward_ssim_to_rgb(
         rd_imgs,
         gt_imgs,
         gauss_filter_1d=gauss_filter_1d,
-        with_hessian=False,
-    )[0]
+        with_hessian=True,
+    )
     end = time.time()
+    assert group_hess is None or group_jacob.shape == group_hess.shape
     group_elapsed = float(end - start)
     group_jacob = group_jacob.cpu().detach().numpy()
 

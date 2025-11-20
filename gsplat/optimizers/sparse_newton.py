@@ -264,8 +264,14 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         hess = None
         if with_hessian:
-            hess = factor * torch.eye(c, dtype=rd_imgs.dtype)
-            hess = hess.view(1, c, c, 1, 1).repeat(n, 1, 1, h, w)
+            # NOTE!!!
+            # hessian_L2_to_RGB dimension=[N, C, C, H, W]
+            # but hessian_L2_to_RGB is repeated constant,
+            #   i.e. eye(3).view(1, C, C, 1, 1).repeated(N, 1, 1, H, W)
+            # no need to allocate GPU memory for every pixel.
+            hess = torch.ones(
+                size=[1, c, 1, 1], dtype=rd_imgs.dtype, device=rd_imgs.device
+            )
         return jacob, hess
 
     @staticmethod
@@ -374,7 +380,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     h0 = ∂g0 / ∂R(m, n) = 0
                     h1 = ∂g1 / ∂R(m, n) = 0
                     h2 = ∂g2 / ∂R(m, n) = 0
-                    h3 = ∂g3 / ∂R(m, n) = 2.0 * W(m, n)
+                    h3 = ∂g3 / ∂R(m, n) 
+                       = 2.0 * W(m, n) * (1.0 - W(m, n))
 
                     ∂ (f1 / f2f3 * g0) / ∂R(m, n)
                     = (f1 / f2f3 * g0)'
@@ -457,14 +464,19 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         del rd_means, gt_means
         torch.cuda.empty_cache()
 
+        # To avoid duplicated computation
+        f0f1 = f0 * f1
+        f2f3 = f2 * f3
+        f2sqf3 = (f2**2) * f3
+        f2f3sq = f2 * (f3**2)
+
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
         jacob = (
-            (f1 / f2 / f3) * g0
-            + (f0 / f2 / f3) * g1
-            - (f0 * f1 / (f2**2) / f3) * g2
-            - (f0 * f1 / f2 / (f3**2)) * g3
+            (f1 / f2f3) * g0
+            + (f0 / f2f3) * g1
+            - (f0f1 / f2sqf3) * g2
+            - (f0f1 / f2f3sq) * g3
         )
-        torch.cuda.empty_cache()
 
         # SSIMLoss = (1.0 - SSIMScore)
         jacob *= -factor
@@ -473,4 +485,46 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
 
         hess = None
+        if with_hessian:
+            hess = (
+                (g1 / f2f3 - (f2 * g3 + f3 * g2) / ((f2f3) ** 2) * f1) * g0
+                + (g0 / f2f3 - (f2 * g3 + f3 * g2) / ((f2f3) ** 2) * f0) * g1
+                + (
+                    (
+                        -(f0 * g1 + f1 * g0) / f2sqf3
+                        + (2.0 * f2f3 * g2 + f2**2 * g3) / ((f2sqf3) ** 2) * f0f1
+                    )
+                    * g2
+                )
+                + (
+                    (
+                        (
+                            -(f0 * g1 + f1 * g0) / f2f3sq
+                            + (2.0 * f2f3 * g3 + f3**2 * g2) / ((f2f3sq) ** 2) * f0f1
+                        )
+                    )
+                    * g3
+                )
+                + (
+                    (
+                        -2.0
+                        * torch.sum(group_ssim._kernel * (1.0 - group_ssim._kernel))
+                        * f0f1
+                        / f2f3sq
+                    )
+                )
+            )
+
+            # NOTE!!!
+            # R, G, B is independent to each other
+            # hessian_SSIM_to_RGB dimension=(N, C, C, H, W)
+            # the (C, C) part of hessian_SSIM_to_RGB is diagonal,
+            # no need to allocate GPU memory for every pixel.
+            # it's a waste of memory and computational resource.
+            # SSIMLoss = (1.0 - SSIMScore)
+            hess *= -factor
+
+        del f0f1, f2f3, f2sqf3, f2f3sq
+        del f0, f1, f2, f3, g0, g1, g2, g3
+        torch.cuda.empty_cache()
         return jacob, hess
