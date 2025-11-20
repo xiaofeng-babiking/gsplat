@@ -214,19 +214,20 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @staticmethod
-    def _jacobian_l2_to_rgb(
+    def _backward_l2_to_rgb(
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
+        with_hessian: bool = True,
     ):
         """Computes Jacobian matrix from L2 to rendering RGB pixels.
 
         Args:
             [1] rd_imgs: Rendering images, Dim=[N, C, H, W], torch.FloatTensor.
             [2] gt_imgs: Groundtruth images, Dim=[N, C, H, W], torch.FloatTensor.
+            [3] with_hessian: Whether to compute Hessian matrix, bool.
 
         Returns:
             [1] jacob: Jacobian matrix from L2 to rendering RGB pixels, Dim=[N, C, H, W], torch.FloatTensor.
-
                     L2 = 0.5 * MEAN(||rd_imgs - gt_imgs||^2)
                     RGB =  { pixel=(r, g, b) | for any pixel in rd_imgs }
                     RGB' = { pixel=(r, g, b) | for any pixel in gt_imgs }
@@ -235,28 +236,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     ∂L2 / ∂(RGB)
                         = [∂L2 / ∂R, ∂L2 / ∂G, ∂L2 / ∂B]
                         = (rd_imgs - gt_imgs) / (N * C * H * W)
-        """
-        n, c, h, w = rd_imgs.shape
-
-        factor = 1.0 / (n * c * h * w)
-
-        jacob = factor * (rd_imgs - gt_imgs)
-        return jacob
-
-    @staticmethod
-    def _hessian_l2_to_rgb(
-        rd_imgs: torch.FloatTensor,
-        gt_imgs: Optional[torch.FloatTensor] = None,
-    ):
-        """Computes Hessian matrix from L2 to rendering RGB pixels.
-
-        Args:
-            [1] rd_imgs: Rendering images, Dim=[N, C, H, W], torch.FloatTensor.
-            [2] gt_imgs: Groundtruth images, Dim=[N, C, H, W], torch.FloatTensor.
-
-        Returns:
-            [1] hess: Hessian matrix from L2 to rendering RGB pixels, Dim=[N, C, C, H, W], torch.FloatTensor.
-
+            [2] hess: Hessian matrix from L2 to rendering RGB pixels, Dim=[N, C, C, H, W], torch.FloatTensor.
                     L2 = 0.5 * MEAN(||rd_imgs - gt_imgs||^2)
 
                     RGB =  { pixel=(r, g, b) | for any pixel in rd_imgs }
@@ -280,12 +260,16 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         factor = 1.0 / (n * c * h * w)
 
-        hess = factor * torch.eye(c, dtype=rd_imgs.dtype)
-        hess = hess.view(1, c, c, 1, 1).repeat(n, 1, 1, h, w)
-        return hess
+        jacob = factor * (rd_imgs - gt_imgs)
+
+        hess = None
+        if with_hessian:
+            hess = factor * torch.eye(c, dtype=rd_imgs.dtype)
+            hess = hess.view(1, c, c, 1, 1).repeat(n, 1, 1, h, w)
+        return jacob, hess
 
     @staticmethod
-    def _jacobian_ssim_to_rgb(
+    def _backward_ssim_to_rgb(
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
         c1: float = 0.01**2,
@@ -294,17 +278,23 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         sigma: float = 1.5,
         padding: Literal["valid", "same"] = "valid",
         gauss_filter_1d: Optional[torch.FloatTensor] = None,
-        eps: float = 1e-12,
+        with_hessian: bool = True,
     ):
         """Computes Jacobian matrix from SSIM to rendering RGB pixels.
 
         Args:
             [1] rd_imgs: Rendering images, Dim=[N, C, H, W], torch.FloatTensor.
             [2] gt_imgs: Groundtruth images, Dim=[N, C, H, W], torch.FloatTensor.
+            [3] c1: SSIM constant term 1, float.
+            [4] c2: SSIM constant term 2, float.
+            [5] kernel_size: Size of Gaussian kernel, int.
+            [6] sigma: Standard deviation of Gaussian kernel, float.
+            [7] padding: Padding mode, Literal["valid", "same"].
+            [8] gauss_filter_1d: 1D Gaussian filter, torch.FloatTensor.
+            [9] with_hessian: Whether to compute Hessian matrix, bool.
 
         Returns:
             [1] jacob: Jacobian matrix from SSIM to rendering RGB pixels, Dim=[N, C, H, W], torch.FloatTensor.
-
                     ∂Ls / ∂(RGB) = [∂Ls / ∂R, ∂Ls / ∂G, ∂Ls / ∂B]
 
                     For a given pixel P=(m, n), R(m, n) denotes its Red value,
@@ -375,11 +365,11 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                        = 2.0 * W(m, n) * R(m, n) - 2.0 * μ * ∂μ(a, b) / R(m, n)
                        = 2.0 * W(m, n) * (R(m, n) - μ)
         """
-        n, c, h, w = rd_imgs.shape
+        nb, nc, h, w = rd_imgs.shape
 
         device = rd_imgs.device
 
-        factor = 1.0 / (n * c * h * w)
+        factor = 1.0 / (nb * nc * h * w)
 
         group_ssim = GroupSSIMLoss(
             kernel_size=kernel_size,
@@ -391,22 +381,61 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         ).to(device)
 
         rd_means = group_ssim.compute_mean(rd_imgs)
-        rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means)
-
         gt_means = group_ssim.compute_mean(gt_imgs)
-        gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means)
-
-        rd_gt_covars = group_ssim.compute_covariance(
-            rd_imgs, rd_means, gt_imgs, gt_means
-        )
 
         ksize = group_ssim._kernel_size
         half_ksize = ksize // 2
-        kernel = group_ssim._kernel.data.clone().detach().squeeze()
+        kernel = group_ssim._kernel.data.clone().detach().to(device)
 
-        # m, n dimension = [H, W]
+        # m, n dimension = [H*W, 1]
         m, n = torch.meshgrid(torch.arange(w), torch.arange(h), indexing="xy")
-        m, n = m.to(device), n.to(device)
+        m, n = m.flatten().to(device)[:, None], n.flatten().to(device)[:, None]
+
+        # i, j dimension = [1, kH*kW]
+        i, j = torch.meshgrid(torch.arange(ksize), torch.arange(ksize), indexing="xy")
+        i, j = i.flatten().to(device)[None, :], j.flatten().to(device)[None, :]
+
+        # a, b dimension = [H*W， kH*KW]
+        a = m + i - half_ksize
+        b = n + j - half_ksize
+
+        mask = (a < 0) | (a >= w) | (b < 0) | (b >= h)
+        mask = mask[None, None, ...].float()
+
+        kernel = kernel.reshape([1, 1, 1, ksize**2])
+        kernel = kernel * mask
+
+        del m, n, i, j, mask
+        torch.cuda.empty_cache()
+
+        a = torch.clamp(a, min=0, max=w - 1)
+        b = torch.clamp(b, min=0, max=h - 1)
+
+        reduce_and_reshape = lambda x: torch.sum(x, dim=-1).reshape(
+            shape=[nb, nc, h, w]
+        )
+
+        # g0 = 2.0 * μ'(a, b) * W(i, j)
+        g_0 = reduce_and_reshape(2.0 * gt_means[..., b, a] * kernel)
+
+        # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
+        g_1 = reduce_and_reshape(
+            2.0 * (gt_imgs.reshape([nb, nc, h * w, 1]) - gt_means[..., b, a]) * kernel
+        )
+
+        # g2 = 2.0 * μ(a, b) * W(i, j)
+        g_2 = reduce_and_reshape(2.0 * rd_means[..., b, a] * kernel)
+
+        # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
+        g_3 = reduce_and_reshape(
+            2.0 * (rd_imgs.reshape([nb, nc, h * w, 1]) - rd_means[..., b, a]) * kernel
+        )
+
+        rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means)
+        gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means)
+        rd_gt_covars = group_ssim.compute_covariance(
+            rd_imgs, rd_means, gt_imgs, gt_means
+        )
 
         # f0 = (c1 + 2.0 * μ * μ')
         f_0 = c1 + 2.0 * rd_means * gt_means
@@ -417,70 +446,26 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         # f3 = (c2 + σ + σ')
         f_3 = c2 + rd_vars + gt_vars
 
+        del rd_means, gt_means, rd_vars, gt_vars, rd_gt_covars
+        torch.cuda.empty_cache()
+
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
-        jacob = torch.zeros_like(rd_imgs)
-        for i in range(ksize):
-            for j in range(ksize):
-                a = m + i - half_ksize
-                b = n + j - half_ksize
-                mask = (a < 0) | (a >= w) | (b < 0) | (b >= h)
+        jacob = (
+            (f_1 / f_2 / f_3) * g_0
+            + (f_0 / f_2 / f_3) * g_1
+            - (f_0 * f_1 / (f_2**2) / f_3) * g_2
+            - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
+        )
 
-                a = torch.clamp(a, min=0, max=w - 1)
-                b = torch.clamp(b, min=0, max=h - 1)
-
-                rd_means_a_b = rd_means[..., b, a]
-                gt_means_a_b = gt_means[..., b, a]
-
-                # g0 = 2.0 * μ'(a, b) * W(i, j)
-                g_0 = 2.0 * gt_means_a_b * kernel[i, j]
-
-                # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
-                g_1 = 2.0 * (gt_imgs - gt_means_a_b) * kernel[i, j]
-
-                # g2 = 2.0 * μ(a, b) * W(i, j)
-                g_2 = 2.0 * rd_means_a_b * kernel[i, j]
-
-                # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
-                g_3 = 2.0 * (rd_imgs - rd_means_a_b) * kernel[i, j]
-
-                jacob_i_j = (
-                    (f_1 / f_2 / f_3) * g_0
-                    + (f_0 / f_2 / f_3) * g_1
-                    - (f_0 * f_1 / (f_2**2) / f_3) * g_2
-                    - (f_0 * f_1 / f_2 / (f_3**2)) * g_3
-                )
-                jacob_i_j[:, :, mask] = 0.0
-
-                jacob += jacob_i_j
-                # torch.cuda.empty_cache()
+        del f_0, f_1, f_2, f_3
+        del g_0, g_1, g_2, g_3
+        torch.cuda.empty_cache()
 
         # SSIMLoss = (1.0 - SSIMScore)
         jacob *= -factor
 
         if padding == "valid":
             jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
-        return jacob
 
-    @staticmethod
-    def _hessian_ssim_to_rgb(
-        rd_imgs: torch.FloatTensor,
-        gt_imgs: torch.FloatTensor,
-    ):
-        """Computes Hessian matrix from SSIM to rendering RGB pixels."""
-        n, c, h, w = rd_imgs.shape
-
-    @staticmethod
-    def _jacobian_rgb_to_position(
-        rd_imgs: torch.FloatTensor,
-        gt_imgs: torch.FloatTensor,
-    ):
-        """Computes Jacobian matrix from RGB to splats' positions."""
-        n, c, h, w = rd_imgs.shape
-
-    @staticmethod
-    def _hessian_rgb_to_position(
-        rd_imgs: torch.FloatTensor,
-        gt_imgs: torch.FloatTensor,
-    ):
-        """Computes Hessian matrix from RGB to splats' positions."""
-        n, c, h, w = rd_imgs.shape
+        hess = None
+        return jacob, hess

@@ -190,7 +190,7 @@ def test_fused_ssim_forward():
         .numpy()
     )
     end = time.time()
-    LOGGER.info(f"Fused SSIM batch-mode Forward-Pass time: {end - start:.6f} second.")
+    elapsed_1 = float(end - start)
     assert np.allclose(
         ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
     ), "Fused SSIM abnormal batch-mode behavior!"
@@ -213,14 +213,19 @@ def test_fused_ssim_forward():
     start = time.time()
     ssim_2_batch = group_ssim(gt_imgs, rd_imgs).cpu().detach().numpy()
     end = time.time()
-    LOGGER.info(f"GroupSSIM batch-mode Forward-Pass time: {end - start:.6f} second.")
+    elapsed_2 = float(end - start)
     assert np.allclose(
         ssim_2, ssim_2_batch, atol=1e-4, rtol=1e-1
     ), f"GroupSSIM abnormal batch-mode behavior!"
 
     assert np.allclose(
         ssim_1, 1.0 - ssim_2, atol=1e-4, rtol=1e-1
-    ), f"Fused and Group SSIM mismatch!"
+    ), f"Fused and Group SSIM forward mismatch!"
+
+    LOGGER.info(
+        f"Forward time fused={elapsed_1:.6f}s, group={elapsed_2:.6f}s "
+        + f"({elapsed_2 / elapsed_1:.4f} slower)."
+    )
 
     torch.cuda.empty_cache()
 
@@ -241,7 +246,7 @@ def test_fused_ssim_backward():
     start = time.time()
     ssim_loss.backward()
     end = time.time()
-    LOGGER.info(f"Pytorch Numerical Backward-Propagate time: {end - start:.6f} second.")
+    torch_elapsed = float(end - start)
     torch_jacob = rd_imgs.grad.clone().cpu().detach().numpy()
 
     rd_imgs = rd_imgs.data.clone().detach()
@@ -249,17 +254,30 @@ def test_fused_ssim_backward():
     torch.cuda.empty_cache()
 
     gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
+    n_imgs = len(rd_imgs)
+    step = 8
     start = time.time()
-    group_jacob = GSGroupNewtonOptimizer._jacobian_ssim_to_rgb(
-        rd_imgs,
-        gt_imgs,
-        gauss_filter_1d=gauss_filter_1d,
-    )
+    group_jacob = [
+        GSGroupNewtonOptimizer._backward_ssim_to_rgb(
+            rd_imgs[i : min(i + step, n_imgs), ...],
+            gt_imgs[i : min(i + step, n_imgs), ...],
+            gauss_filter_1d=gauss_filter_1d,
+            with_hessian=False,
+        )[0]
+        for i in range(0, len(rd_imgs), step)
+    ]
+    group_jacob = torch.cat(group_jacob, dim=0)
     end = time.time()
-    LOGGER.info(f"GroupSSIM Analytic Backward-Compute time: {end - start:.6f} second.")
+    group_elapsed = float(end - start)
     group_jacob = group_jacob.cpu().detach().numpy()
 
-    assert np.allclose(torch_jacob, group_jacob, atol=1e-4, rtol=1e-1)
+    assert np.allclose(
+        torch_jacob, group_jacob, atol=1e-4, rtol=1e-1
+    ), f"Fused and Group SSIM backward mismatch!"
+    LOGGER.info(
+        f"Backward time fused={torch_elapsed:.6f}s, group={group_elapsed:.6f}s "
+        + f"({group_elapsed / torch_elapsed:.4f} slower)."
+    )
     torch.cuda.empty_cache()
 
 
