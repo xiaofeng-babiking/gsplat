@@ -478,12 +478,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             - (f0f1 / f2f3sq) * g3
         )
 
-        # SSIMLoss = (1.0 - SSIMScore)
-        jacob *= -factor
-
-        if padding == "valid":
-            jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
-
         hess = None
         if with_hessian:
             hess = (
@@ -521,10 +515,19 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             # the (C, C) part of hessian_SSIM_to_RGB is diagonal,
             # no need to allocate GPU memory for every pixel.
             # it's a waste of memory and computational resource.
-            # SSIMLoss = (1.0 - SSIMScore)
-            hess *= -factor
+            # hessian_SSIM_to_RGB (N, C, C, H, W) -> (N, C, H, W)
 
         del f0f1, f2f3, f2sqf3, f2f3sq
         del f0, f1, f2, f3, g0, g1, g2, g3
         torch.cuda.empty_cache()
+
+        # SSIMLoss = (1.0 - SSIMScore)
+        jacob *= -factor
+        if hess is not None:
+            hess *= -factor
+
+        if padding == "valid":
+            jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
+            if hess is not None:
+                hess[:, :, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
         return jacob, hess
