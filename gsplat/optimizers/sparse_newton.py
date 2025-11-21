@@ -388,8 +388,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         device = rd_imgs.device
 
-        factor = 1.0 / (nb * nc * h * w)
-
         group_ssim = GroupSSIMLoss(
             kernel_size=kernel_size,
             sigma=sigma,
@@ -442,7 +440,25 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         f2f3sq = f2 * (f3**2)
 
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
-        jacob = g0(f1 / f2f3) + g1(f0 / f2f3) - g2(f0f1 / f2sqf3) - g3(f0f1 / f2f3sq)
+        if padding == "valid":
+            mask = torch.zeros(
+                size=(1, 1, h, w),
+                dtype=torch.float32,
+                device=device,
+                requires_grad=False,
+            )
+            mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
+            factor = 1.0 / (nb * nc * (h - 10) * (w - 10))
+        else:
+            mask = 1.0
+            factor = 1.0 / (nb * nc * h * w)
+
+        jacob = (
+            g0(f1 / f2f3 * mask)
+            + g1(f0 / f2f3 * mask)
+            - g2(f0f1 / f2sqf3 * mask)
+            - g3(f0f1 / f2f3sq * mask)
+        )
 
         hess = None
         if with_hessian:
@@ -452,14 +468,4 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         jacob *= -factor
         if hess is not None:
             hess *= -factor
-
-        if padding == "valid":
-            mask = torch.ones(
-                size=(1, 1, h, w), dtype=torch.bool, device=device, requires_grad=False
-            ).repeat((nb, nc, 1, 1))
-            mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0
-
-            jacob[mask] = 0.0
-            if hess is not None:
-                hess[mask] = 0.0
         return jacob, hess

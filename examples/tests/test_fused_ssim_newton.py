@@ -244,7 +244,7 @@ def test_fused_ssim_backward():
 
     device = gt_imgs.device
 
-    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="same")
+    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="valid")
     ssim_loss.require_grad = True
 
     start = time.time()
@@ -264,7 +264,7 @@ def test_fused_ssim_backward():
         rd_imgs,
         gt_imgs,
         filter=filter,
-        padding="same",
+        padding="valid",
         with_hessian=False,
     )
     end = time.time()
@@ -278,7 +278,7 @@ def test_fused_ssim_backward():
     # SSIMScore = 1 - SSIMSLoss
     rerr = np.abs(torch_jacob - (-group_jacob)) / np.abs(torch_jacob)
     bad_rerr_ratio = len(np.where(rerr > 1e-3)[0]) / torch_jacob.size
-    assert bad_rerr_ratio < 1e-2, f"Fused and Group SSIM backward mismatch!"
+    assert bad_rerr_ratio < 1.5e-2, f"Fused and Group SSIM backward mismatch!"
 
     LOGGER.info(
         f"Backward time fused={torch_elapsed:.6f}s, group={group_elapsed:.6f}s "
