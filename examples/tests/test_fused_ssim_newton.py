@@ -32,7 +32,9 @@ LOGGER = create_logger(
 )
 
 
-def parse_fused_ssim_gauss_filter_1d(marco_str: Optional[str] = None):
+def parse_fused_ssim_gauss_filter_1d(
+    marco_str: Optional[str] = None,
+) -> torch.FloatTensor:
     """ "Parse Gaussian filter 1D from fused-ssim macro string."""
     if marco_str is None:
         marco_str = """
@@ -51,8 +53,8 @@ def parse_fused_ssim_gauss_filter_1d(marco_str: Optional[str] = None):
     pattern = re.compile(r"#define\s+G_([0-9]+)\s+(.*)f", re.MULTILINE)
     matches = [(int(i), float(x)) for i, x in pattern.findall(marco_str.strip())]
 
-    filter_1d = torch.tensor([x for _, x in sorted(matches)], dtype=torch.float32)
-    return filter_1d
+    filter = torch.tensor([x for _, x in sorted(matches)], dtype=torch.float32)
+    return filter
 
 
 def generate_render_data_sample():
@@ -195,8 +197,9 @@ def test_fused_ssim_forward():
         ssim_1, ssim_1_batch, atol=1e-4, rtol=1e-1
     ), "Fused SSIM abnormal batch-mode behavior!"
 
+    filter = parse_fused_ssim_gauss_filter_1d().to(device)
     group_ssim = GroupSSIMLoss(
-        gauss_filter_1d=parse_fused_ssim_gauss_filter_1d().to(device),
+        filter=filter,
         c1=0.01**2,
         c2=0.03**2,
         padding="valid",
@@ -218,8 +221,9 @@ def test_fused_ssim_forward():
         ssim_2, ssim_2_batch, atol=1e-4, rtol=1e-1
     ), f"GroupSSIM abnormal batch-mode behavior!"
 
+    # SSIMScore = 1 - SSIMSLoss
     assert np.allclose(
-        ssim_1, 1.0 - ssim_2, atol=1e-4, rtol=1e-1
+        ssim_1, 1.0 - ssim_2, atol=1e-6, rtol=1e-4
     ), f"Fused and Group SSIM forward mismatch!"
 
     LOGGER.info(
@@ -240,7 +244,7 @@ def test_fused_ssim_backward():
 
     device = gt_imgs.device
 
-    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="valid")
+    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="same")
     ssim_loss.require_grad = True
 
     start = time.time()
@@ -251,23 +255,29 @@ def test_fused_ssim_backward():
 
     rd_imgs = rd_imgs.data.clone().detach()
     rd_imgs.requires_grad = False
+    rd_imgs.grad = None
     torch.cuda.empty_cache()
 
-    gauss_filter_1d = parse_fused_ssim_gauss_filter_1d().to(device)
+    filter = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
     group_jacob, group_hess = GSGroupNewtonOptimizer._backward_ssim_to_rgb(
         rd_imgs,
         gt_imgs,
-        gauss_filter_1d=gauss_filter_1d,
-        with_hessian=True,
+        filter=filter,
+        padding="same",
+        with_hessian=False,
     )
     end = time.time()
     assert group_hess is None or group_jacob.shape == group_hess.shape
     group_elapsed = float(end - start)
     group_jacob = group_jacob.cpu().detach().numpy()
 
+    torch_jacob *= torch_jacob.size
+    group_jacob *= group_jacob.size
+
+    # SSIMScore = 1 - SSIMSLoss
     assert np.allclose(
-        torch_jacob, group_jacob, atol=1e-4, rtol=1e-1
+        torch_jacob, -group_jacob, atol=1e-4, rtol=1e-1
     ), f"Fused and Group SSIM backward mismatch!"
     LOGGER.info(
         f"Backward time fused={torch_elapsed:.6f}s, group={group_elapsed:.6f}s "

@@ -15,45 +15,53 @@ class GroupSSIMLoss(_Loss):
         c1: float = 0.01**2,
         c2: float = 0.03**2,
         padding: Literal["same", "valid"] = "valid",
-        gauss_filter_1d: Optional[torch.FloatTensor] = None,
+        filter: Optional[torch.FloatTensor] = None,
         size_average=None,
         reduce=None,
         reduction: Literal["mean", "sum", "none"] = "mean",
         *args,
         **kwargs,
     ):
-        self._kernel_size = kernel_size
-        self._sigma = sigma
         self._c1 = c1
         self._c2 = c2
         self._padding = padding
-        self._filter = gauss_filter_1d
         self._reduction = reduction
         super().__init__(size_average, reduce, reduction, *args, **kwargs)
 
-        self._kernel = self.create_gauss_kernel_2d()
+        _kernel_size, _sigma, _filter, _kernel = GroupSSIMLoss.create_gauss_kernel_2d(
+            kernel_size=kernel_size,
+            sigma=sigma,
+            filter=filter,
+        )
+        self._kernel_size = _kernel_size
+        self._sigma = _sigma
+        self._filter = torch.nn.Parameter(_filter, requires_grad=False)
+        self._kernel = torch.nn.Parameter(_kernel, requires_grad=False)
 
-    def create_gauss_kernel_2d(self) -> torch.FloatTensor:
+    @staticmethod
+    def create_gauss_kernel_2d(
+        kernel_size: Optional[int] = None,
+        sigma: Optional[float] = None,
+        filter: Optional[torch.FloatTensor] = None,
+    ) -> torch.FloatTensor:
         """Create 2D Gaussian Kernel for SSIM convolution."""
-        if self._filter is not None:
-            _, opt_sigma = GroupSSIMLoss._fit_gauss_filter_1d(
-                self._filter.cpu().detach().numpy(),
+        if filter is not None:
+            _, sigma = GroupSSIMLoss._fit_gauss_filter_1d(
+                filter.cpu().detach().numpy(),
             )
 
-            self._kernel_size = len(self._filter)
-            self._sigma = opt_sigma
+            kernel_size = len(filter)
         else:
-            filter_1d = GroupSSIMLoss._evaluate_gauss_filter_1d(
-                x=np.arange(self._kernel_size),
-                mu=self._kernel_size // 2,
-                sigma=self._sigma,
+            filter = GroupSSIMLoss._evaluate_gauss_filter_1d(
+                x=np.arange(kernel_size),
+                mu=kernel_size // 2,
+                sigma=sigma,
             )
-            self._filter = torch.from_numpy(filter_1d).float()
+            filter = torch.from_numpy(filter).float()
 
-        # outer product
-        kernel_2d = torch.outer(self._filter, self._filter)
         # [out_channel, in_channel, kernel_size, kernel_size] -> [1, 1, K, K]
-        return kernel_2d[None, None, ...]
+        kernel = torch.outer(filter, filter)[None, None, ...]
+        return kernel_size, sigma, filter, kernel
 
     @staticmethod
     def _evaluate_gauss_filter_1d(x: np.ndarray, mu: float, sigma: float):
@@ -66,11 +74,9 @@ class GroupSSIMLoss(_Loss):
         return y
 
     @staticmethod
-    def _fit_gauss_filter_1d(
-        gauss_filter_1d: np.ndarray,
-    ) -> Tuple[float, float]:
+    def _fit_gauss_filter_1d(filter: np.ndarray) -> Tuple[float, float]:
         """Given a Gaussian filter in 1D, find its mean and variance."""
-        n_items = len(gauss_filter_1d)
+        n_items = len(filter)
 
         opt_mu = n_items // 2  # Central point of the Gaussian filter
 
@@ -80,8 +86,8 @@ class GroupSSIMLoss(_Loss):
 
         popt, _ = curve_fit(
             fit_func,
-            xdata=np.arange(len(gauss_filter_1d)),
-            ydata=gauss_filter_1d,
+            xdata=np.arange(len(filter)),
+            ydata=filter,
         )
 
         opt_sigma = popt[0]
@@ -94,25 +100,27 @@ class GroupSSIMLoss(_Loss):
             + f"size={self._kernel_size}, mean={self._kernel_size // 2}, variance={self._sigma:.6f}."
         )
 
-    def compute_mean(self, img: torch.FloatTensor):
+    @staticmethod
+    def compute_mean(img: torch.FloatTensor, kernel: torch.FloatTensor):
         """Compute mean of an image."""
         c = img.shape[1]
 
         mean = torch.conv2d(
             img,
-            torch.tile(self._kernel, (c, 1, 1, 1)),
+            torch.tile(kernel, (c, 1, 1, 1)),
             stride=1,
             padding="same",
             groups=c,
         )
         return mean
 
+    @staticmethod
     def compute_covariance(
-        self,
         img0: torch.FloatTensor,
         mean_0: Optional[torch.FloatTensor] = None,
         img1: Optional[torch.FloatTensor] = None,
         mean_1: Optional[torch.FloatTensor] = None,
+        kernel: Optional[torch.FloatTensor] = None,
     ):
         """Compute covariance between two images."""
         if img1 is not None:
@@ -120,13 +128,11 @@ class GroupSSIMLoss(_Loss):
                 img0.shape == img1.shape
             ), "Source and target image must have the same shape!"
 
-        c = img0.shape[1]
-
         if mean_0 is None:
-            mean_0 = self.compute_mean(img0)
+            mean_0 = GroupSSIMLoss.compute_mean(img0, kernel)
 
         if img1 is not None and mean_1 is None:
-            mean_1 = self.compute_mean(img1)
+            mean_1 = GroupSSIMLoss.compute_mean(img1, kernel)
 
         # No need to compute target mean when targe image is None
         mean_1 = None if img1 is None else mean_1
@@ -136,13 +142,11 @@ class GroupSSIMLoss(_Loss):
                 mean_0.shape == mean_1.shape
             ), "Mean tensors must have the same shape!"
 
-        covar = torch.conv2d(
-            (img0 * img1) if img1 is not None else (img0**2),
-            torch.tile(self._kernel, (c, 1, 1, 1)),
-            stride=1,
-            padding="same",
-            groups=c,
-        ) - ((mean_0 * mean_1) if img1 is not None else (mean_0**2))
+        covar = (
+            GroupSSIMLoss.compute_mean(
+                img0 * img1 if img1 is not None else img0**2, kernel
+            )
+        ) - (mean_0 * mean_1 if mean_1 is not None else mean_0**2)
         return covar
 
     def forward(
@@ -154,18 +158,20 @@ class GroupSSIMLoss(_Loss):
             input.shape == target.shape
         ), "source and target image must have the same shape!"
 
-        src_mean = self.compute_mean(input)
-        dst_mean = self.compute_mean(target)
+        src_mean = self.compute_mean(input, kernel=self._kernel)
+        dst_mean = self.compute_mean(target, kernel=self._kernel)
 
-        src_var = self.compute_covariance(input, src_mean)
-        dst_var = self.compute_covariance(target, dst_mean)
-        src_dst_covar = self.compute_covariance(input, src_mean, target, dst_mean)
+        src_var = self.compute_covariance(input, src_mean, kernel=self._kernel)
+        dst_var = self.compute_covariance(target, dst_mean, kernel=self._kernel)
+        src_dst_covar = self.compute_covariance(
+            input, src_mean, target, dst_mean, kernel=self._kernel
+        )
 
-        a = self._c1 + src_mean**2 + dst_mean**2
-        b = self._c2 + src_var + dst_var
-        c = self._c1 + 2.0 * src_mean * dst_mean
-        d = self._c2 + 2.0 * src_dst_covar
-        ssim_map = (c * d) / (a * b)
+        f0 = self._c1 + 2.0 * src_mean * dst_mean
+        f1 = self._c2 + 2.0 * src_dst_covar
+        f2 = self._c1 + src_mean**2 + dst_mean**2
+        f3 = self._c2 + src_var + dst_var
+        ssim_map = (f0 * f1) / (f2 * f3)
 
         half_ksize = self._kernel_size // 2
         if self._padding == "valid":
@@ -236,25 +242,19 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     ∂L2 / ∂(RGB)
                         = [∂L2 / ∂R, ∂L2 / ∂G, ∂L2 / ∂B]
                         = (rd_imgs - gt_imgs) / (N * C * H * W)
-            [2] hess: Hessian matrix from L2 to rendering RGB pixels, Dim=[N, C, C, H, W], torch.FloatTensor.
-                    L2 = 0.5 * MEAN(||rd_imgs - gt_imgs||^2)
-
-                    RGB =  { pixel=(r, g, b) | for any pixel in rd_imgs }
+            [2] hess: Hessian matrix from L2 to rendering RGB pixels, Dim=[N, C, H, W], torch.FloatTensor.
                     ∂²L2 / ∂(RGB)²
                     = [[∂²L2 / ∂R²,  ∂L2 / ∂R∂G, ∂L2 / ∂R∂B],
                        [∂²L2 / ∂R∂G, ∂²L2 / ∂G², ∂L2 / ∂G∂B],
                        [∂²L2 / ∂R∂B, ∂L2 / ∂G∂B, ∂²L2 / ∂B²]]
                     Since R, G and B are independent with each other,
-                    ∂²L2 / ∂(RGB)²
-                    = [[∂²L2 / ∂R², 0, 0],
-                       [0, ∂²L2 / ∂G², 0],
-                       [0, 0, ∂²L2 / ∂B²]]
-                    = [[∂(J_R) / ∂R, 0, 0],
-                       [0, ∂(J_G) / ∂G, 0],
-                       [0, 0, ∂(J_B) / ∂B]] where J_R = ∂L2 / ∂R
-                    = [[1, 0, 0],
-                       [0, 1, 0],
-                       [0, 0, 1]] / (N * C * H * W)
+                    = diagonal([1, 1, 1]).view(N, C, C, H, W)
+
+                    NOTE!!!
+                    R, G, B channel is irrelevant to each other,
+                    therefore hessian_L2_to_RGB is diagonal,
+                    dimension [N, C, C, H, W] could be compressed as [N, C, H, W].
+                    no need to allocate memory for every pixel.
         """
         n, c, h, w = rd_imgs.shape
 
@@ -268,7 +268,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             # hessian_L2_to_RGB dimension=[N, C, C, H, W]
             # but hessian_L2_to_RGB is repeated constant,
             #   i.e. eye(3).view(1, C, C, 1, 1).repeated(N, 1, 1, H, W)
-            # no need to allocate GPU memory for every pixel.
+            #
             hess = torch.ones(
                 size=[1, c, 1, 1], dtype=rd_imgs.dtype, device=rd_imgs.device
             )
@@ -283,7 +283,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         kernel_size: int = 11,
         sigma: float = 1.5,
         padding: Literal["valid", "same"] = "valid",
-        gauss_filter_1d: Optional[torch.FloatTensor] = None,
+        filter: Optional[torch.FloatTensor] = None,
         with_hessian: bool = True,
     ):
         """Computes Jacobian matrix from SSIM to rendering RGB pixels.
@@ -296,7 +296,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             [5] kernel_size: Size of Gaussian kernel, int.
             [6] sigma: Standard deviation of Gaussian kernel, float.
             [7] padding: Padding mode, Literal["valid", "same"].
-            [8] gauss_filter_1d: 1D Gaussian filter, torch.FloatTensor.
+            [8] filter: 1D Gaussian filter, torch.FloatTensor.
             [9] with_hessian: Whether to compute Hessian matrix, bool.
 
         Returns:
@@ -306,107 +306,83 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     For a given pixel P=(m, n), R(m, n) denotes its Red value,
 
                     ∂Ls / ∂R = { ∂Ls / ∂R(m, n) | for all pixels P=(m, n) in rendering image }
-
-                    ∂Ls / ∂R(m, n)
-                        = SUM_i_j( ∂fs(m + i - kW // 2, n + j - kH // 2, R) / ∂R(m, n) )
+                    Let,
+                        a = m + i - kW // 2
+                        b = n + j - kH // 2
+                    Then,
+                        ∂Ls / ∂R(m, n)
+                            = SUM_i_j( ∂fs(m + i - kW // 2, n + j - kH // 2, R) / ∂R(m, n) )
+                            = SUM_a_b(
+                                ∂Ls / ∂fs(a, b, R) 
+                                * ∂fs(a, b, R) / ∂R(m, n)
+                              )
+                    
+                    fs(a, b, R) 
+                        = (c1 + 2.0 * μ(a, b, R) * μ'(a, b, R)) * (c2 + 2.0 * Σ(a, b, R)) \
+                            / (c1 + μ(a, b, R) ** 2 + μ'(a, b, R) ** 2) * (c2 + σ(a, b, R) + σ'(a, b, R))
                     where,
-                        (kW, kH) denotes the 2D Gaussian kernel size;
-                        fs(a, b, R) denotes SSIM error (Red part) center at pixel Q=(a, b);
-                    Here fs(a, b, R) actually computes:
-                        weighted contribution of P=(m, n) 
-                            to different "gaussian-2D-convolution-kernels",
-                    For example,
-                        i=0,       j=0,       P(m, n) -> right-bottom corner of the kernel
-                        i=kW - 1,  j=0,       P(m, n) -> left-bottom corner of the kernel
-                        i=0,       j=kH - 1,  P(m, n) -> right-top corner of the kernel
-                        i=kW - 1,  j=kH - 1,  P(m, n) -> left-top corner of the kernel
-                        i=kW // 2, j=kH // 2, P(m, n) -> center of the kernel
-                    for example,
-                    Let (a, b) = (m + i - kW // 2, n + j - kH // 2)
-                    then,
-                        fs(a, b, R) 
-                            = (c1 + 2.0 * μ * μ') * (c2 + 2.0 * Σ) \
-                                / (c1 + μ ** 2 + μ' ** 2) * (c2 + σ + σ')
-                        where,
-                            μ, μ' = mean of Rendering/Groundtruth kernel Red values
-                            σ, σ' = variance of Rendering/Groundtruth kernel Red values
-                            Σ = covariance between Rendering and Groundtruth kernel Red values
-                            c1, c2 = constant terms
+                        μ, μ' = mean of Rendering/Groundtruth kernel Red values
+                        σ, σ' = variance of Rendering/Groundtruth kernel Red values
+                        Σ = covariance between Rendering and Groundtruth kernel Red values
+                        c1, c2 = constant terms
                     
                     Let,
-                        f0 = (c1 + 2.0 * μ * μ')
-                        f1 = (c2 + 2.0 * Σ)
-                        f2 = (c1 + μ ** 2 + μ' ** 2)
-                        f3 = (c2 + σ + σ')
-                        g0 = ∂f0 / ∂R(m, n)
-                        g1 = ∂f1 / ∂R(m, n)
-                        g2 = ∂f2 / ∂R(m, n)
-                        g3 = ∂f3 / ∂R(m, n)
+                        f0(a, b, R) = (c1 + 2.0 * μ(a, b, R) * μ'(a, b, R)))
+                        f1(a, b, R) = (c2 + 2.0 * Σ(a, b, R))
+                        f2(a, b, R) = (c1 + μ(a, b, R) ** 2 + μ'(a, b, R) ** 2)
+                        f3(a, b, R) = (c2 + σ(a, b, R) + σ'(a, b, R))
                     Then,
                         fs(a, b, R) = (f0 * f1) / (f2 * f3)
-                    
-                    ∂fs(a, b, R) / ∂R(m, n)
-                        = ∂(f0 * f1) / ∂R(m, n) / (f2 * f3) - (f0 * f1) / ((f2 * f3) ** 2) * ∂ (f2 * f3) / ∂R(m, n)
-                        = (g0 * f1 + f0 * g1) / (f2 * f3) - (f0 * f1) / ((f2 * f3) ** 2) * (g2 * f3 + f2 * g3)
-                        = (f1/f2/f3)*g0 + (f0/f2/f3)*g1 - (f0*f1/(f2**2)/f3)*g2 - (f0*f1/f2/(f3**2))*g3
-                    
-                    μ(a, b) <- W(m, n) * R(m, n)
-                    Σ(a, b) <- W(m, n) * R(m, n) * R'(m, n) - μ(a, b) * μ'(a, b)
-                    σ(a, b) <- W(m, n) * (R(m, n) ** 2) - μ(a, b) ** 2
 
-                    W(m, n) 
-                        = W(m - a + kW // 2, n - b + kH // 2)
-                        = W(kW - 1 - i, kH - 1 - j)
-                        = W(i, j) # gaussian distribution sysmetric
-
-                    g0 = 2.0 * μ' * ∂μ(a, b) / R(m, n) 
-                       = 2.0 * μ' * W(m, n)                     
-                    g1 = 2.0 * ∂Σ(a, b) / R(m, n) 
-                       = 2.0 * W(m, n) * R'(m, n) - 2.0 * μ'* ∂μ(a, b) / R(m, n)
-                       = 2.0 * W(m, n) * (R'(m, n) - μ'(a, b))
-                    g2 = 2.0 * μ * ∂μ(a, b) / R(m, n)
-                       = 2.0 * μ * W(m, n)
-                    g3 = ∂σ(a, b) / R(m, n)
-                       = 2.0 * W(m, n) * R(m, n) - 2.0 * μ * ∂μ(a, b) / R(m, n)
-                       = 2.0 * W(m, n) * R(m, n) - 2.0 * μ * ∂μ(a, b) / R(m, n)
-                       = 2.0 * W(m, n) * (R(m, n) - μ)
+                    μ(a, b, R) 
+                        <- W(m, n, a, b) * R(m, n) 
+                            # W(m, n, a, b) weight of R(m, n) contributing to R(a, b)'s mean
+                        <- W(m - a + kW // 2, n - b + kW // 2) * R(m, n)
+                        <- W(i, j) * R(m, n)
+                    ∂μ(a, b, R) / ∂R(m, n) = W(i, j)
+                    g0 = ∂f0(a, b, R) / ∂R(m, n)
+                       = 2.0 * μ'(a, b, R) * (∂μ / ∂R(m, n))
+                       = W(i, j) * 2.0 * μ'(a, b, R)
                     
-                    jacobian = 
-                        f1 / f2f3 * g0
-                        + f0 / f2f3 * g1
-                        - f0f1 / f2²f3 * g2
-                        - f0f1 / f2f3² * g3
+                    And,
+                        SUM_i_j(W(i, j) * 2.0 * μ'(a, b, R) * ?(a, b, R))
+                            = W ⊗ (2.0 * μ'(a, b, R) * ?(a, b, R)))
+                    Thus,
+                        g0 = lambda x: 2.0 * W ⊗ (μ'(a, b, R) * x) 
+                            i.e. in (a, b) coordinate space
+                                (W ⊗) is a mapping from (a, b) to (m, n) space
+
+                    
+                    Σ(a, b, R)
+                        <- W(i, j) * (R(m, n) * R'(m, n)) - μ'(a, b, R) * μ(a, b, R)
+                        <- R'(m, n) * W(i, j) * R(m, n) - μ'(a, b, R) * μ(a, b, R)
+                    ∂Σ(a, b, R) / ∂R(m, n)
+                        = R'(m, n) * W(i, j) - μ'(a, b, R) * ∂μ(a, b, R) / ∂R(m, n)
+                        = W(i, j) * R'(m, n) - W(i, j) * μ'(a, b, R))
+                    SUM_i_j(W(i, j) * R'(m, n) * ?(a, b, R) - W(i, j) * μ'(a, b, R) * ?(a, b, R))
+                        = R'(m, n) * (W ⊗ ?(a, b, R)) - W ⊗ (μ'(a, b, R) * ?(a, b, R))
+                    Then,
+                        g1 = lambda x: 2.0 * R'(m, n) * W ⊗ x - 2.0 * W ⊗ (μ'(a, b, R) * x)
+                    
+                    g2 = lambda x: 2.0 * W ⊗ (μ(a, b, R) * x)
+                    g3 = lambda x: 2.0 * R(m, n) * W ⊗ x - 2.0 * W ⊗ (μ(a, b, R) * x)
+                    
+                    jacob = g0(f1 / f2f3) + g1(f0 / f2f3) - g2(f0f1 / f2²f3) - g3(f0f1 / f2f3²)
+            
             [2] hess: Hessian matrix from SSIM to rendering RGB pixels, Dim=[N, C, C, H, W], torch.FloatTensor.
-                    h0 = ∂g0 / ∂R(m, n) = 0
-                    h1 = ∂g1 / ∂R(m, n) = 0
-                    h2 = ∂g2 / ∂R(m, n) = 0
-                    h3 = ∂g3 / ∂R(m, n) 
-                       = 2.0 * W(m, n) * (1.0 - W(m, n))
 
-                    ∂ (f1 / f2f3 * g0) / ∂R(m, n)
-                    = (f1 / f2f3 * g0)'
-                    = (f1 / f2f3)' * g0 + (f1 / f2f3) * h0
-                    = (g1 / f2f3 - f1 * (f2f3)' / f2²f3²) * g0
-                    = (g1 / f2f3 - f1 * (g2f3 + f2g3) / f2²f3²) * g0
+                    NOTE!!! 
+                    R, G, B channel is irrelevant to each other,
+                    therefore hessian_SSIM_to_RGB is diagonal,
+                    dimension [N, C, C, H, W] could be compressed as [N, C, H, W].
+                    no need to allocate memory for every pixel.
 
-                    ∂ (f0 / f2f3 * g1) / ∂R(m, n)
-                    = (f0 / f2f3 * g1)'
-                    = (f0 / f2f3)' * g1 + (f0 / f2f3) * h1
-                    = (g0 / f2f3 - f0 * (f2f3)' / f2²f3²) * g1
-                    = (g0 / f2f3 - f0 * (g2f3 + f2g3) / f2²f3²) * g1
-
-                    ∂ (f0f1 / f2²f3 * g2) / ∂R(m, n)
-                    = (f0f1 / f2²f3 * g2)'
-                    = (f0f1 / f2²f3)' * g2 + (f0f1 / f2²f3) * h2
-                    = (（f0f1）' / f2²f3 - f0f1 * (f2²f3)' / f2⁴f3²) * g2
-                    = ((g0f1 + f0g1) / f2²f3 - f0f1 * (2*f2f3g2 + f2²g3) / (f2²f3)²) * g2
-                    
-                    ∂(f0f1 / f2f3² * g3) / ∂R(m, n)
-                    = (f0f1 / f2f3² * g3)'
-                    = (f0f1 / f2f3²)' * g3 + (f0f1 / f2f3²) * h3
-                    = ((f0f1)' / f2f3² - f0f1 * (f2f3²)' / (f2f3²)²) * g3 + (f0f1 / f2f3²) * h3
-                    = ((g0f1 + f0g1) / f2f3² - f0f1 * (g2f3² + 2*f2f3g3) / (f2f3²)²) * g3 + (f0f1 / f2f3²) * h3
-
+                    h0 = ∂g0(m, n, R) / ∂R(m, n) = 0
+                    h1 = ∂g1(m, n, R) / ∂R(m, n) = 0
+                    h2 = ∂g2(m, n, R) / ∂R(m, n) 
+                       = lambda x: 2.0 * W^2 ⊗ x
+                    h3 = ∂g3(m, n, R) / ∂R(m, n)
+                       = lambda x: 2.0 * (W - W^2) ⊗ x
         """
         nb, nc, h, w = rd_imgs.shape
 
@@ -420,18 +396,19 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             c1=c1,
             c2=c2,
             padding=padding,
-            gauss_filter_1d=gauss_filter_1d,
+            filter=filter,
         ).to(device)
 
+        kernel = group_ssim._kernel.clone().detach()
         ksize = group_ssim._kernel_size
         half_ksize = ksize // 2
 
-        rd_means = group_ssim.compute_mean(rd_imgs)
-        gt_means = group_ssim.compute_mean(gt_imgs)
-        rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means)
-        gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means)
+        rd_means = group_ssim.compute_mean(rd_imgs, kernel=kernel)
+        gt_means = group_ssim.compute_mean(gt_imgs, kernel=kernel)
+        rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means, kernel=kernel)
+        gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means, kernel=kernel)
         rd_gt_covars = group_ssim.compute_covariance(
-            rd_imgs, rd_means, gt_imgs, gt_means
+            rd_imgs, rd_means, gt_imgs, gt_means, kernel=kernel
         )
         # f0 = (c1 + 2.0 * μ * μ')
         f0 = c1 + 2.0 * rd_means * gt_means
@@ -442,27 +419,21 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         # f3 = (c2 + σ + σ')
         f3 = c2 + rd_vars + gt_vars
 
-        del rd_vars, gt_vars, rd_gt_covars
-        torch.cuda.empty_cache()
+        # g0 = lambda x: 2.0 * W ⊗ (μ'(a, b, R) * x)
+        g0 = lambda x: 2.0 * group_ssim.compute_mean(gt_means * x, kernel=kernel)
 
-        # g0 = 2.0 * μ'(a, b) * W(i, j)
-        #    = 2.0 * μ'(m + i - kW // 2 , n + j - kH // 2) * W(i, j)
-        g0 = 2.0 * group_ssim.compute_mean(gt_means)
+        # g1 = lambda x: 2.0 * R'(m, n) * W ⊗ x - 2.0 * W ⊗ (μ'(a, b, R) * x)
+        g1 = lambda x: 2.0 * gt_imgs * group_ssim.compute_mean(
+            x, kernel=kernel
+        ) - 2.0 * group_ssim.compute_mean(gt_means * x, kernel=kernel)
 
-        # g1 = 2.0 * W(i, j) * (R'(m, n) - μ'(a, b))
-        #    = 2.0 * W(i, j) * R'(m, n) - g0
-        #    = 2.0 * W(i, j) * R'(m, n)
-        #    = 2.0 * constant * R'(m, n) - g0
-        g1 = 2.0 * torch.sum(group_ssim._kernel) * gt_imgs - g0
+        # g2 = lambda x: 2.0 * W ⊗ (μ(a, b, R) * x)
+        g2 = lambda x: 2.0 * group_ssim.compute_mean(rd_means * x, kernel=kernel)
 
-        # g2 = 2.0 * μ(a, b) * W(i, j)
-        g2 = 2.0 * group_ssim.compute_mean(rd_means)
-
-        # g3 = 2.0 * W(i, j) * (R(m, n) - μ(a, b))
-        g3 = 2.0 * torch.sum(group_ssim._kernel) * rd_imgs - g2
-
-        del rd_means, gt_means
-        torch.cuda.empty_cache()
+        # g3 = lambda x: 2.0 * R(m, n) * W ⊗ x - 2.0 * W ⊗ (μ(a, b, R) * x)
+        g3 = lambda x: 2.0 * rd_imgs * group_ssim.compute_mean(
+            x, kernel=kernel
+        ) - 2.0 * group_ssim.compute_mean(rd_means * x, kernel=kernel)
 
         # To avoid duplicated computation
         f0f1 = f0 * f1
@@ -471,55 +442,11 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         f2f3sq = f2 * (f3**2)
 
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
-        jacob = (
-            (f1 / f2f3) * g0
-            + (f0 / f2f3) * g1
-            - (f0f1 / f2sqf3) * g2
-            - (f0f1 / f2f3sq) * g3
-        )
+        jacob = g0(f1 / f2f3) + g1(f0 / f2f3) - g2(f0f1 / f2sqf3) - g3(f0f1 / f2f3sq)
 
         hess = None
         if with_hessian:
-            hess = (
-                (g1 / f2f3 - (f2 * g3 + f3 * g2) / ((f2f3) ** 2) * f1) * g0
-                + (g0 / f2f3 - (f2 * g3 + f3 * g2) / ((f2f3) ** 2) * f0) * g1
-                + (
-                    (
-                        -(f0 * g1 + f1 * g0) / f2sqf3
-                        + (2.0 * f2f3 * g2 + f2**2 * g3) / ((f2sqf3) ** 2) * f0f1
-                    )
-                    * g2
-                )
-                + (
-                    (
-                        (
-                            -(f0 * g1 + f1 * g0) / f2f3sq
-                            + (2.0 * f2f3 * g3 + f3**2 * g2) / ((f2f3sq) ** 2) * f0f1
-                        )
-                    )
-                    * g3
-                )
-                + (
-                    (
-                        -2.0
-                        * torch.sum(group_ssim._kernel * (1.0 - group_ssim._kernel))
-                        * f0f1
-                        / f2f3sq
-                    )
-                )
-            )
-
-            # NOTE!!!
-            # R, G, B is independent to each other
-            # hessian_SSIM_to_RGB dimension=(N, C, C, H, W)
-            # the (C, C) part of hessian_SSIM_to_RGB is diagonal,
-            # no need to allocate GPU memory for every pixel.
-            # it's a waste of memory and computational resource.
-            # hessian_SSIM_to_RGB (N, C, C, H, W) -> (N, C, H, W)
-
-        del f0f1, f2f3, f2sqf3, f2f3sq
-        del f0, f1, f2, f3, g0, g1, g2, g3
-        torch.cuda.empty_cache()
+            raise NotImplementedError
 
         # SSIMLoss = (1.0 - SSIMScore)
         jacob *= -factor
@@ -527,7 +454,12 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             hess *= -factor
 
         if padding == "valid":
-            jacob[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
+            mask = torch.ones(
+                size=(1, 1, h, w), dtype=torch.bool, device=device, requires_grad=False
+            )
+            mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0
+
+            jacob[mask] = 0.0
             if hess is not None:
-                hess[:, :, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0.0
+                hess[mask] = 0.0
         return jacob, hess
