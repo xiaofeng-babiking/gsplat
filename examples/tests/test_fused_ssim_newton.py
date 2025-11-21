@@ -276,12 +276,14 @@ def test_fused_ssim_backward():
     group_jacob *= group_jacob.size
 
     # SSIMScore = 1 - SSIMSLoss
-    assert np.allclose(
-        torch_jacob, -group_jacob, atol=1e-4, rtol=1e-1
-    ), f"Fused and Group SSIM backward mismatch!"
+    rerr = np.abs(torch_jacob - (-group_jacob)) / np.abs(torch_jacob)
+    bad_rerr_ratio = len(np.where(rerr > 1e-3)[0]) / torch_jacob.size
+    assert bad_rerr_ratio < 1e-2, f"Fused and Group SSIM backward mismatch!"
+
     LOGGER.info(
         f"Backward time fused={torch_elapsed:.6f}s, group={group_elapsed:.6f}s "
         + f"({group_elapsed / torch_elapsed:.4f} slower)."
+        + f"Ratio relative error > 1e-3: {bad_rerr_ratio * 100.0:.4f}%."
     )
     torch.cuda.empty_cache()
 

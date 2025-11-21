@@ -456,7 +456,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         if padding == "valid":
             mask = torch.ones(
                 size=(1, 1, h, w), dtype=torch.bool, device=device, requires_grad=False
-            )
+            ).repeat((nb, nc, 1, 1))
             mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 0
 
             jacob[mask] = 0.0
