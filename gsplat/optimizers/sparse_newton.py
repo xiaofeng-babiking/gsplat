@@ -411,14 +411,11 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         )
 
         if padding == "valid":
-            mask = (
-                torch.ones(
-                    size=(1, 1, h, w),
-                    dtype=torch.float32,
-                    device=device,
-                    requires_grad=False,
-                )
-                * eps
+            mask = torch.zeros(
+                size=(1, 1, h, w),
+                dtype=torch.float32,
+                device=device,
+                requires_grad=False,
             )
             mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
             factor = 1.0 / (nb * nc * (h - half_ksize * 2) * (w - half_ksize * 2))
@@ -453,9 +450,9 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         # To avoid duplicated computation
         f0f1 = f0 * f1
-        f2f3 = f2 * f3
-        f2sqf3 = (f2**2) * f3
-        f2f3sq = f2 * (f3**2)
+        f2f3 = f2 * f3 + eps
+        f2sqf3 = (f2**2) * f3 + eps
+        f2f3sq = f2 * (f3**2) + eps
 
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
         jacob = g0(f1 / f2f3) + g1(f0 / f2f3) - g2(f0f1 / f2sqf3) - g3(f0f1 / f2f3sq)
@@ -475,17 +472,17 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                 + g2(
                     g1(-f0 / f2sqf3)
                     + g0(-f1 / f2sqf3)
-                    + g2(2.0 * f2f3 * f0 * f1 / (f2sqf3**2))
-                    + g3((f2**2) * f0 * f1 / (f2sqf3**2))
+                    + g2(2.0 * f2f3 * f0f1 / (f2sqf3**2))
+                    + g3((f2**2) * f0f1 / (f2sqf3**2))
                 )
-                + h2(-f0 * f1 / f2sqf3)
+                + h2(-f0f1 / f2sqf3)
                 + g3(
                     g1(-f0 / f2f3sq)
                     + g0(-f1 / f2f3sq)
-                    + g3(2.0 * f2f3 * f0 * f1 / (f2f3sq**2))
-                    + g2((f3**2) * f0 * f1 / (f2f3sq**2))
+                    + g3(2.0 * f2f3 * f0f1 / (f2f3sq**2))
+                    + g2((f3**2) * f0f1 / (f2f3sq**2))
                 )
-                + h3(-f0 * f1 / f2f3sq)
+                + h3(-f0f1 / f2f3sq)
             )
 
         # SSIMLoss = (1.0 - SSIMScore)

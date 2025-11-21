@@ -266,6 +266,7 @@ def test_fused_ssim_backward():
         filter=filter,
         padding="valid",
         with_hessian=True,
+        eps = 1e-15
     )
     end = time.time()
     group_elapsed = float(end - start)
