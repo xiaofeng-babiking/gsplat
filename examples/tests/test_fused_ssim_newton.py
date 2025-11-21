@@ -265,7 +265,7 @@ def test_fused_ssim_backward():
         gt_imgs,
         filter=filter,
         padding="valid",
-        with_hessian=False,
+        with_hessian=True,
     )
     end = time.time()
     assert group_hess is None or group_jacob.shape == group_hess.shape

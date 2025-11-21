@@ -417,7 +417,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                 requires_grad=False,
             )
             mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
-            factor = 1.0 / (nb * nc * (h - 10) * (w - 10))
+            factor = 1.0 / (nb * nc * (h - half_ksize * 2) * (w - half_ksize * 2))
         else:
             mask = 1.0
             factor = 1.0 / (nb * nc * h * w)
@@ -458,7 +458,31 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         hess = None
         if with_hessian:
-            raise NotImplementedError
+            h2 = lambda x: 2.0 * group_ssim.compute_mean(x, kernel=kernel**2)
+            h3 = lambda x: 2.0 * group_ssim.compute_mean(
+                x, kernel=kernel * (1.0 - kernel)
+            )
+
+            hess = (
+                g0(g1(1.0 / f2f3) + g3(-f1 * f2 / (f2f3**2)) + g2(-f1 * f3 / (f2f3**2)))
+                + g1(
+                    g0(1.0 / f2f3) + g3(-f0 * f2 / (f2f3**2)) + g2(-f0 * f3 / (f2f3**2))
+                )
+                + g2(
+                    g1(-f0 / f2sqf3)
+                    + g0(-f1 / f2sqf3)
+                    + g2(2.0 * f2f3 * f0 * f1 / (f2sqf3**2))
+                    + g3((f2**2) * f0 * f1 / (f2sqf3**2))
+                )
+                + h2(-f0 * f1 / f2sqf3)
+                + g3(
+                    g1(-f0 / f2f3sq)
+                    + g0(-f1 / f2f3sq)
+                    + g3(2.0 * f2f3 * f0 * f1 / (f2f3sq**2))
+                    + g2((f3**2) * f0 * f1 / (f2f3sq**2))
+                )
+                + h3(-f0 * f1 / f2f3sq)
+            )
 
         # SSIMLoss = (1.0 - SSIMScore)
         jacob *= -factor
