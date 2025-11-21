@@ -408,14 +408,28 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         rd_gt_covars = group_ssim.compute_covariance(
             rd_imgs, rd_means, gt_imgs, gt_means, kernel=kernel
         )
+
+        if padding == "valid":
+            mask = torch.zeros(
+                size=(1, 1, h, w),
+                dtype=torch.float32,
+                device=device,
+                requires_grad=False,
+            )
+            mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
+            factor = 1.0 / (nb * nc * (h - 10) * (w - 10))
+        else:
+            mask = 1.0
+            factor = 1.0 / (nb * nc * h * w)
+
         # f0 = (c1 + 2.0 * μ * μ')
-        f0 = c1 + 2.0 * rd_means * gt_means
+        f0 = (c1 + 2.0 * rd_means * gt_means) * mask
         # f1 = (c2 + 2.0 * Σ)
-        f1 = c2 + 2.0 * rd_gt_covars
+        f1 = (c2 + 2.0 * rd_gt_covars) * mask
         # f2 = (c1 + μ ** 2 + μ' ** 2)
-        f2 = c1 + rd_means**2 + gt_means**2
+        f2 = (c1 + rd_means**2 + gt_means**2) * mask
         # f3 = (c2 + σ + σ')
-        f3 = c2 + rd_vars + gt_vars
+        f3 = (c2 + rd_vars + gt_vars) * mask
 
         # g0 = lambda x: 2.0 * W ⊗ (μ'(a, b, R) * x)
         g0 = lambda x: 2.0 * group_ssim.compute_mean(gt_means * x, kernel=kernel)
@@ -440,25 +454,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         f2f3sq = f2 * (f3**2)
 
         # TODO： CUDA pixelwise parallel computation inside a gaussian kernel
-        if padding == "valid":
-            mask = torch.zeros(
-                size=(1, 1, h, w),
-                dtype=torch.float32,
-                device=device,
-                requires_grad=False,
-            )
-            mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
-            factor = 1.0 / (nb * nc * (h - 10) * (w - 10))
-        else:
-            mask = 1.0
-            factor = 1.0 / (nb * nc * h * w)
-
-        jacob = (
-            g0(f1 / f2f3 * mask)
-            + g1(f0 / f2f3 * mask)
-            - g2(f0f1 / f2sqf3 * mask)
-            - g3(f0f1 / f2f3sq * mask)
-        )
+        jacob = g0(f1 / f2f3) + g1(f0 / f2f3) - g2(f0f1 / f2sqf3) - g3(f0f1 / f2f3sq)
 
         hess = None
         if with_hessian:
