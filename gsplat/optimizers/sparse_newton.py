@@ -285,6 +285,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         padding: Literal["valid", "same"] = "valid",
         filter: Optional[torch.FloatTensor] = None,
         with_hessian: bool = True,
+        eps: float = 1e-12,
     ):
         """Computes Jacobian matrix from SSIM to rendering RGB pixels.
 
@@ -410,11 +411,14 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         )
 
         if padding == "valid":
-            mask = torch.zeros(
-                size=(1, 1, h, w),
-                dtype=torch.float32,
-                device=device,
-                requires_grad=False,
+            mask = (
+                torch.ones(
+                    size=(1, 1, h, w),
+                    dtype=torch.float32,
+                    device=device,
+                    requires_grad=False,
+                )
+                * eps
             )
             mask[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize] = 1.0
             factor = 1.0 / (nb * nc * (h - half_ksize * 2) * (w - half_ksize * 2))

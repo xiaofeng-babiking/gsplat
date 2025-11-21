@@ -268,9 +268,22 @@ def test_fused_ssim_backward():
         with_hessian=True,
     )
     end = time.time()
-    assert group_hess is None or group_jacob.shape == group_hess.shape
     group_elapsed = float(end - start)
     group_jacob = group_jacob.cpu().detach().numpy()
+
+    assert not np.any(
+        np.isnan(group_jacob) | np.isinf(group_jacob)
+    ), "Group SSIM jacobian contains NaN or Inf!"
+
+    if group_hess is not None:
+        group_hess = group_hess.cpu().detach().numpy()
+
+        assert group_hess.shape == group_jacob.shape
+        f"Group SSIM jacobian and hessian shape mismatch!"
+
+        assert not np.any(
+            np.isnan(group_hess) | np.isinf(group_hess)
+        ), "Group SSIM jacobian contains NaN or Inf!"
 
     torch_jacob *= torch_jacob.size
     group_jacob *= group_jacob.size
