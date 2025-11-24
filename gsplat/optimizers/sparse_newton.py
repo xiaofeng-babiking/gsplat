@@ -220,7 +220,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @staticmethod
-    def _backward_l2_to_rgb(
+    def _backward_l2_to_render(
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
         with_hessian: bool = True,
@@ -275,7 +275,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         return jacob, hess
 
     @staticmethod
-    def _backward_ssim_to_rgb(
+    def _backward_ssim_to_render(
         rd_imgs: torch.FloatTensor,
         gt_imgs: torch.FloatTensor,
         c1: float = 0.01**2,
@@ -490,3 +490,26 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         if hess is not None:
             hess *= -factor
         return jacob, hess
+
+    def _backward_render_to_position(
+        self, rd_imgs: torch.FloatTensor, splats: Dict[str, torch.FloatTensor]
+    ):
+        """Backward pass of rendered pixels w.r.t splats' positions."""
+        pass
+
+    def __backward_render_to_sh_color(
+        self,
+        rd_imgs: torch.FloatTensor,
+        rd_views: torch.FloatTensor,
+        splats: Dict[str, torch.FloatTensor],
+    ):
+        """Backward pass of rendered pixels w.r.t spherical harmonics colors.
+
+        RGB = SUM_k(G(k, m, n) * σ(k) * SH(r(k), sh_coeffs(k)) * MULTIPLY_j(1.0 - G(j, m, n) * σ(j)))
+        where,
+            0 < j <= k-1, and k is sorted by gaussian splats' depths
+            G(k, m, n) is the 3D gaussian weight if pixel (m, n) located at k-th splat's tile
+            σ(k) is the k-th splat's opacity
+            SH(r(k), sh_coeffs(k)) is the k-th splat's spherical harmonic integrated color from view r(k)
+        """
+        pass

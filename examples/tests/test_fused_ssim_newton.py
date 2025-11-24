@@ -260,7 +260,7 @@ def test_fused_ssim_backward():
 
     filter = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
-    group_jacob, group_hess = GSGroupNewtonOptimizer._backward_ssim_to_rgb(
+    group_jacob, group_hess = GSGroupNewtonOptimizer._backward_ssim_to_render(
         rd_imgs,
         gt_imgs,
         filter=filter,
@@ -300,6 +300,8 @@ def test_fused_ssim_backward():
         + f"Ratio relative error > 1e-3: {bad_rerr_ratio * 100.0:.4f}%."
     )
     torch.cuda.empty_cache()
+
+
 
 
 if __name__ == "__main__":
