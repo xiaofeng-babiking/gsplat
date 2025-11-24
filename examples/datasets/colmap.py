@@ -11,12 +11,13 @@ from pycolmap import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
 
-from .normalize import (
+from normalize import (
     align_principal_axes,
     similarity_from_cameras,
     transform_cameras,
     transform_points,
 )
+from sklearn.neighbors import BallTree
 
 
 def _get_rel_paths(path_dir: str) -> List[str]:
@@ -343,8 +344,8 @@ class Parser:
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
-        scene_center = np.mean(camera_locations, axis=0)
-        dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+        self.scene_center = np.mean(camera_locations, axis=0)
+        dists = np.linalg.norm(camera_locations - self.scene_center, axis=1)
         self.scene_scale = np.max(dists)
 
 
@@ -434,28 +435,129 @@ class Dataset:
         return data
 
 
+class NeighborDataset(Dataset):
+    def __init__(
+        self,
+        parser: Parser,
+        split: str = "train",
+        patch_size: Optional[int] = None,
+        load_depths: bool = False,
+        num_neighbors: int = 3,
+        max_view_angle: float = 90.0,
+    ):
+        super().__init__(parser, split, patch_size, load_depths)
+        self.num_neighbors = num_neighbors
+        self.max_view_angle = max_view_angle
+
+        if num_neighbors > 0:
+            if self.parser.points is not None and len(self.parser.points) > 0:
+                self.parser.scene_center = np.mean(self.parser.points, axis=0)
+                self.parser.scene_scale = np.percentile(
+                    np.linalg.norm(
+                        self.parser.points - self.parser.scene_center, axis=1
+                    ),
+                    95,
+                )
+
+            self.ball_tree = BallTree(
+                self.parser.camtoworlds[self.indices].reshape([len(self.indices), -1]),
+                metric=lambda x, y: NeighborDataset.distance_between_camera_views(
+                    x,
+                    y,
+                    scene_center=self.parser.scene_center,
+                    scene_bound=self.parser.scene_scale,
+                    max_view_angle=self.max_view_angle,
+                ),
+            )
+
+    @staticmethod
+    def distance_between_camera_views(
+        cam_to_world_a: np.ndarray,
+        cam_to_world_b: np.ndarray,
+        scene_center: np.ndarray,
+        scene_bound: float,
+        max_view_angle: float = 90.0,
+    ) -> float:
+        """Compute distance between two camera views."""
+        # transform matrix 4x4 or 3x4
+        tf_mat_a = cam_to_world_a.reshape(-1, 4)
+        tf_mat_b = cam_to_world_b.reshape(-1, 4)
+
+        eps = 1e-12
+
+        z_axis_a = tf_mat_a[:3, 2]
+        z_axis_a = z_axis_a / (np.linalg.norm(z_axis_a) + eps)
+        z_axis_b = tf_mat_b[:3, 2]
+        z_axis_b = z_axis_b / (np.linalg.norm(z_axis_b) + eps)
+
+        angle = np.arccos(np.dot(z_axis_a, z_axis_b)) / np.pi * 180.0
+        if angle > max_view_angle:
+            return np.inf
+
+        dir_a = tf_mat_a[:3, 3] - scene_center
+        dir_a = dir_a / (np.linalg.norm(dir_a) + eps)
+        dir_b = tf_mat_b[:3, 3] - scene_center
+        dir_b = dir_b / (np.linalg.norm(dir_b) + eps)
+
+        dist = np.arccos(np.dot(dir_a, dir_b)) * scene_bound
+        return dist
+
+    def __getitem__(self, item: int) -> Dict[str, Any]:
+        data = Dataset.__getitem__(self, item)
+
+        if self.num_neighbors > 0:
+            data = {k: [v] for k, v in data.items()}
+
+            index = self.indices[item]
+
+            ngb_items = self.ball_tree.query(
+                self.parser.camtoworlds[index].reshape(1, -1), k=self.num_neighbors + 1
+            )[1][0][1:]
+            for ngb_item in ngb_items:
+                ngb_data = Dataset.__getitem__(self, ngb_item)
+
+                for k in data:
+                    data[k] += [ngb_data[k]]
+
+            data["image_id"] = torch.tensor(data["image_id"], dtype=torch.uint32)
+            for key in ["K", "camtoworld", "image"]:
+                data[key] = torch.concat([x[None] for x in data[key]], dim=0)
+            for key in ["points", "depths"]:
+                pass
+        return data
+
+
 if __name__ == "__main__":
     import argparse
 
     import imageio.v2 as imageio
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="/home/babiking/mnt/Datasets.writable-by-babiking/mipnerf360/garden",
+    )
     parser.add_argument("--factor", type=int, default=4)
+    parser.add_argument("--num_neighbors", type=int, default=3)
     args = parser.parse_args()
 
     # Parse COLMAP data.
     parser = Parser(
         data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
     )
-    dataset = Dataset(parser, split="train", load_depths=True)
-    print(f"Dataset: {len(dataset)} images.")
+    dataset = NeighborDataset(
+        parser, split="train", load_depths=True, num_neighbors=args.num_neighbors
+    )
+    print(f"Dataset: {len(dataset)} images with K={args.num_neighbors}.")
+
+    packed = args.num_neighbors > 0
 
     writer = imageio.get_writer("results/points.mp4", fps=30)
     for data in tqdm(dataset, desc="Plotting points"):
-        image = data["image"].numpy().astype(np.uint8)
-        points = data["points"].numpy()
-        depths = data["depths"].numpy()
+        image = (data["image"][0] if packed else data["image"]).numpy().astype(np.uint8)
+        points = (data["points"][0] if packed else data["points"]).numpy()
+        depths = (data["depths"][0] if packed else data["depths"]).numpy()
         for x, y in points:
             cv2.circle(image, (int(x), int(y)), 2, (255, 0, 0), -1)
         writer.append_data(image)
