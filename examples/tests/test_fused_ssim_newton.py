@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import re
 import time
+import random
 import torch
 import cv2 as cv
 import numpy as np
@@ -14,9 +15,13 @@ from collections import namedtuple
 from typing import OrderedDict, Optional
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
-from gsplat.rendering import rasterization
+from gsplat.rendering import rasterization, spherical_harmonics, rasterize_to_pixels
 from gsplat.logger import create_logger
-from gsplat.optimizers.sparse_newton import GroupSSIMLoss, GSGroupNewtonOptimizer
+from gsplat.optimizers.sparse_newton import (
+    GroupSSIMLoss,
+    GSGroupNewtonOptimizer,
+    raster_to_pixels_torch,
+)
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 
@@ -57,7 +62,7 @@ def parse_fused_ssim_gauss_filter_1d(
     return filter
 
 
-def generate_render_data_sample():
+def generate_render_data_sample(batch_mode: bool = True):
     """Generate rendering sample data to evaluate SSIM."""
     LOGGER.info(
         f"Start to parse COLMAP data from {os.path.basename(COLMAP_DATA_PATH)}..."
@@ -117,18 +122,43 @@ def generate_render_data_sample():
     assert gt_imgs.shape[0] == n_imgs
 
     LOGGER.info(f"Start to render {n_imgs} images with resolution={img_w}x{img_h}...")
-    rd_imgs, rd_alphas, rd_metas = rasterization(
-        means=splats["means"],
-        quats=splats["quats"],
-        scales=torch.exp(splats["scales"]),
-        opacities=torch.sigmoid(splats["opacities"]),
-        colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
-        Ks=Ks,
-        viewmats=viewmats,
-        width=img_w,
-        height=img_h,
-        sh_degree=sh_deg,
-    )
+    if batch_mode:
+        rd_imgs, rd_alphas, rd_metas = rasterization(
+            means=splats["means"],
+            quats=splats["quats"],
+            scales=torch.exp(splats["scales"]),
+            opacities=torch.sigmoid(splats["opacities"]),
+            colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
+            Ks=Ks,
+            viewmats=viewmats,
+            width=img_w,
+            height=img_h,
+            sh_degree=sh_deg,
+            packed=True,
+        )
+    else:
+        rd_imgs = []
+        rd_alphas = []
+        rd_metas = []
+        for i in range(n_imgs):
+            rd_img, rd_alpha, rd_meta = rasterization(
+                means=splats["means"],
+                quats=splats["quats"],
+                scales=torch.exp(splats["scales"]),
+                opacities=torch.sigmoid(splats["opacities"]),
+                colors=torch.cat([splats["sh0"], splats["shN"]], dim=1),
+                Ks=Ks[i].unsqueeze(0),
+                viewmats=viewmats[i].unsqueeze(0),
+                width=img_w,
+                height=img_h,
+                sh_degree=sh_deg,
+                packed=True,
+            )
+            rd_imgs.append(rd_img)
+            rd_alphas.append(rd_alpha)
+            rd_metas.append(rd_meta)
+        rd_imgs = torch.concatenate(rd_imgs, dim=0)
+        rd_alphas = torch.concatenate(rd_alphas, dim=0)
     LOGGER.info(f"Finished rendering {n_imgs} images.")
 
     rd_imgs = torch.permute(rd_imgs, dims=[0, 3, 1, 2])
@@ -155,12 +185,12 @@ def generate_render_data_sample():
         render_alpha=rd_alphas,
         render_metadata=rd_metas,
     )
-    return data
+    return data, splats
 
 
 def test_fused_ssim_forward():
     """Test forward pass of Fused SSIM."""
-    data = generate_render_data_sample()
+    data, _ = generate_render_data_sample(batch_mode=True)
 
     gt_imgs = data.groundtruth_image.contiguous()
     rd_imgs = data.render_image.contiguous()
@@ -236,7 +266,7 @@ def test_fused_ssim_forward():
 
 def test_fused_ssim_backward():
     """Test backward pass of Fused SSIM."""
-    data = generate_render_data_sample()
+    data, _ = generate_render_data_sample(batch_mode=True)
 
     gt_imgs = data.groundtruth_image.contiguous()
     rd_imgs = data.render_image.contiguous()
@@ -261,12 +291,7 @@ def test_fused_ssim_backward():
     filter = parse_fused_ssim_gauss_filter_1d().to(device)
     start = time.time()
     group_jacob, group_hess = GSGroupNewtonOptimizer._backward_ssim_to_render(
-        rd_imgs,
-        gt_imgs,
-        filter=filter,
-        padding="valid",
-        with_hessian=True,
-        eps = 1e-15
+        rd_imgs, gt_imgs, filter=filter, padding="valid", with_hessian=True, eps=1e-15
     )
     end = time.time()
     group_elapsed = float(end - start)
@@ -302,8 +327,98 @@ def test_fused_ssim_backward():
     torch.cuda.empty_cache()
 
 
+def test_render_color_forward():
+    """Test backward pass of spherical harmonics color."""
+    data, splats = generate_render_data_sample(batch_mode=False)
+
+    gt_imgs = data.groundtruth_image.contiguous()
+    # rd_imgs = data.render_image.contiguous()
+    rd_metas = data.render_metadata
+    # cam_mats = data.camera_matrix.contiguous()
+    view_mats = data.view_matrix.contiguous()
+
+    n_cams = gt_imgs.shape[0]
+    cam_idx = random.choice(list(range(n_cams)))
+
+    view_mat = view_mats[cam_idx]
+
+    rd_meta = rd_metas[cam_idx]
+
+    gt_img = gt_imgs[cam_idx]
+    img_h, img_w, _ = gt_img.shape
+
+    n_splats = len(rd_meta["means2d"])
+
+    gauss_idxs = rd_meta["gaussian_ids"]
+
+    view_dirs = splats["means"][gauss_idxs] - torch.linalg.inv(view_mat)[:3, 3][None]
+    view_masks = (rd_meta["radii"] > 0).all(dim=-1)
+    sh_coeffs = torch.cat([splats["sh0"][gauss_idxs], splats["shN"][gauss_idxs]], dim=1)
+    rd_colors = spherical_harmonics(
+        degrees_to_use=int(np.sqrt(sh_coeffs.shape[-2])) - 1,
+        dirs=view_dirs,
+        coeffs=sh_coeffs,
+        masks=view_masks,
+    )
+    rd_colors = torch.clamp_min(rd_colors + 0.5, 0.0)
+
+    tile_size = rd_meta["tile_size"]
+    tile_h = int(np.ceil(rd_meta["height"] / tile_size))
+    assert tile_h == rd_meta["tile_height"]
+    tile_w = int(np.ceil(rd_meta["width"] / tile_size))
+    assert tile_w == rd_meta["tile_width"]
+
+    isect_offsets = rd_meta["isect_offsets"][0].flatten()
+    assert len(isect_offsets) == tile_h * tile_w
+
+    assert len(torch.unique(rd_meta["flatten_ids"])) == len(rd_meta["means2d"])
+
+    start = time.time()
+    rd_img, rd_alphas = rasterize_to_pixels(
+        means2d=rd_meta["means2d"],
+        conics=rd_meta["conics"],
+        colors=rd_colors,
+        opacities=rd_meta["opacities"],
+        image_height=rd_meta["height"],
+        image_width=rd_meta["width"],
+        tile_size=rd_meta["tile_size"],
+        isect_offsets=rd_meta["isect_offsets"],
+        flatten_ids=rd_meta["flatten_ids"],
+        packed=True,
+    )
+    end = time.time()
+    cuda_elapsed = float(end - start)
+    LOGGER.info(
+        f"CUDA #Splats={n_splats}, Image={img_w}x{img_h}, Elapsed={cuda_elapsed:.6f} seconds."
+    )
+
+    max_workers = 16
+    start = time.time()
+    fwd_img, fwd_alphas = raster_to_pixels_torch(
+        means2d=rd_meta["means2d"],
+        conics=rd_meta["conics"],
+        colors=rd_colors,
+        opacities=rd_meta["opacities"],
+        image_height=rd_meta["height"],
+        image_width=rd_meta["width"],
+        tile_size=rd_meta["tile_size"],
+        isect_offsets=rd_meta["isect_offsets"],
+        flatten_ids=rd_meta["flatten_ids"],
+        packed=True,
+        max_workers=max_workers,
+    )
+    end = time.time()
+    torch_elapsed = float(end - start)
+    LOGGER.info(
+        f"Torch #Worker={max_workers}, #Splats={n_splats}, Elapsed={torch_elapsed:.6f} seconds"
+        + f"(Slower={(torch_elapsed / cuda_elapsed):.4f})"
+    )
+
+    assert torch.allclose(rd_img, fwd_img, atol=0.1)
+    assert torch.allclose(rd_alphas, fwd_alphas, atol=0.01)
 
 
 if __name__ == "__main__":
+    test_render_color_forward()
     test_fused_ssim_forward()
     test_fused_ssim_backward()
