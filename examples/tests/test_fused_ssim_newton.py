@@ -439,14 +439,14 @@ def test_render_color_forward():
         blend_alphas = tile_meta["blend_alphas"]
 
         tile_img = torch.sum(
-            splat_alphas[:, :, :, None]  # [tK, tile_size, tile_size, 1]
-            * blend_alphas[:, :, :, None]  # [tK, tile_size, tile_size, 1]
+            splat_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+            * blend_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
             * sh_colors_cache[img_idx, splat_idxs, :][
-                :, None, None, :
-            ],  # [tK, 1, 1, 3]
-            dim=0,
+                None, None, :, :
+            ],  # [1, 1, tK, 3]
+            dim=-2,
         )
-        tile_alphas = 1.0 - blend_alphas[-1, :, :, None]
+        tile_alphas = 1.0 - blend_alphas[:, :, -1, None]
 
         paste_xmin = tile_x * tile_size
         paste_width = min(tile_size, img_w - paste_xmin)
