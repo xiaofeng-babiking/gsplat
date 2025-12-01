@@ -1,11 +1,11 @@
 import torch
 import numpy as np
 from scipy.optimize import curve_fit
-import torch.multiprocessing as mp
 from torch.nn.modules.loss import _Loss
 from enum import Enum
 from collections.abc import Iterable
 from typing import Dict, Any, Optional, Literal, Tuple
+from gsplat.rendering import spherical_harmonics
 
 
 class GroupSSIMLoss(_Loss):
@@ -197,158 +197,6 @@ class GSParameterGroup(Enum):
     SCALE = 2  # 3DOFs scale (sx, sy, sz)
     OPACITY = 3  # 1DOF opacity
     COLOR = 4  # Spherical Harmonic coefficients Dimension = (L + 1)^2
-
-
-def raster_to_one_tile_torch(
-    means2d: torch.FloatTensor,
-    conics: torch.FloatTensor,
-    colors: torch.LongTensor,
-    opacities: torch.FloatTensor,
-    tile_row: int,
-    tile_col: int,
-    tile_size: int,
-):
-    """Raster to one tile using PyTorch backend."""
-    device = means2d.device
-
-    # gaussian distribution
-    #   G(x) = 1 / sqrt(2 * pi * sigma^2) * exp(-(x - mu)^2 / (2 * sigma^2))
-    xs, ys = torch.meshgrid(
-        [torch.arange(tile_size), torch.arange(tile_size)], indexing="xy"
-    )
-    xs, ys = xs.to(device).float(), ys.to(device).float()
-    xs = xs + tile_size * tile_col + 0.5
-    ys = ys + tile_size * tile_row + 0.5
-
-    dxs = xs - means2d[:, 0][:, None, None]
-    dys = ys - means2d[:, 1][:, None, None]
-
-    sigmas = 0.5 * (
-        dxs * dxs * conics[:, 0][:, None, None]
-        + dys * dys * conics[:, 2][:, None, None]
-        + 2.0 * dxs * dys * conics[:, 1][:, None, None]
-    )
-
-    alphas = torch.clamp_max(opacities[:, None, None] * torch.exp(-sigmas), 0.9999)
-
-    cum_alphas = torch.cumprod(1.0 - alphas, dim=0)
-    cum_alphas = torch.roll(cum_alphas, shifts=1, dims=0)
-    cum_alphas[0, :, :] = 1.0
-
-    blend_colors = torch.sum(
-        alphas[:, :, :, None]  # [K, tile_size, tile_size, 1]
-        * cum_alphas[:, :, :, None]  # [K, tile_size, tile_size, 1]
-        * colors[:, None, None, :],  # [K, 1, 1, 3]
-        dim=0,
-    )
-    blend_alphas = 1.0 - cum_alphas[-1, :, :, None]
-    return blend_colors, blend_alphas
-
-
-def raster_to_pixels_torch(
-    means2d: torch.FloatTensor,
-    conics: torch.FloatTensor,
-    colors: torch.FloatTensor,
-    opacities: torch.FloatTensor,
-    image_height: int,
-    image_width: int,
-    tile_size: int,
-    isect_offsets: torch.LongTensor,
-    flatten_ids: torch.LongTensor,
-    packed: bool = True,
-):
-    """Raster to render pixel space based on tiles.
-
-    Args:
-        [1] means2d: Mean of 2D Gaussian filter, Dim=[K, 2], torch.FloatTensor.
-        [2] conics: Inverse of 2D covariance, Dim=[K, 2], torch.FloatTensor.
-        [3] colors: View dependent RGB color, Dim=[K, 3], torch.FloatTensor.
-        [4] opacities: Opacity of view, Dim=[K, 1], torch.FloatTensor.
-        [5] image_height: Height of rendered image, int.
-        [6] image_width: Width of rendered image, int.
-        [7] tile_size: Size of tile, int.
-        [8] isect_offsets: Offset of intersection tiles, Dim=[tH*tW], torch.LongTensor.
-        [9] flatten_ids: Flattened index of gaussian splats within each tile, Dim=[N], torch.LongTensor.
-        [10] packed: Whether to use packed mode, bool.
-
-    Returns:
-        [1] render_colors: Rendered colors, Dim=[N, C, H, W], torch.FloatTensor.
-        [2] render_opacities: Rendered opacities, Dim=[N, 1, H, W], torch.FloatTensor.
-    """
-    assert packed, "Only support packed mode!"
-
-    tile_h = int(np.ceil(image_height / tile_size))
-    tile_w = int(np.ceil(image_width / tile_size))
-
-    isect_offsets = isect_offsets.squeeze().flatten()
-
-    device = means2d.device
-
-    means2d.share_memory_()
-    conics.share_memory_()
-    colors.share_memory_()
-    opacities.share_memory_()
-
-    # mp.set_start_method("spawn")
-
-    # NOTE: only support single image rasterization!
-    render_colors = (
-        torch.zeros((1, image_height, image_width, 3), dtype=torch.float32)
-        .to(device)
-        .share_memory_()
-    )
-    render_alphas = (
-        torch.zeros((1, image_height, image_width, 1), dtype=torch.float32)
-        .to(device)
-        .share_memory_()
-    )
-
-    for tile_row in range(tile_h):
-        for tile_col in range(tile_w):
-            tile_idx = tile_row * tile_w + tile_col
-
-            head = isect_offsets[tile_idx]
-            tail = (
-                isect_offsets[tile_idx + 1]
-                if tile_idx < len(isect_offsets) - 1
-                else len(flatten_ids)
-            )
-
-            if head >= tail:
-                continue
-
-            flat_idxs = flatten_ids[head:tail]
-
-            blend_colors, blend_alphas = raster_to_one_tile_torch(
-                means2d[flat_idxs],
-                conics[flat_idxs],
-                colors[flat_idxs],
-                opacities[flat_idxs],
-                tile_row,
-                tile_col,
-                tile_size,
-            )
-
-            paste_row = tile_row * tile_size
-            paste_h = min(tile_size, image_height - paste_row)
-            paste_col = tile_col * tile_size
-            paste_w = min(tile_size, image_width - paste_col)
-
-            render_colors[
-                0,
-                paste_row : paste_row + paste_h,
-                paste_col : paste_col + paste_w,
-                :,
-            ] = blend_colors[:paste_h, :paste_w, :]
-
-            render_alphas[
-                0,
-                paste_row : paste_row + paste_h,
-                paste_col : paste_col + paste_w,
-                :,
-            ] = blend_alphas[:paste_h, :paste_w, :]
-
-    return render_colors, render_alphas
 
 
 class GSGroupNewtonOptimizer(torch.optim.Optimizer):
@@ -644,6 +492,156 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             hess *= -factor
         return jacob, hess
 
+    @staticmethod
+    def _cache_tile_to_splats_alphas(
+        means2d: torch.FloatTensor,
+        conics: torch.FloatTensor,
+        opacities: torch.FloatTensor,
+        img_height: int,
+        img_width: int,
+        tile_size: int,
+        isect_offsets: torch.LongTensor,
+        flatten_ids: torch.LongTensor,
+    ):
+        """Cache splats-to-pixels alpha-blending intermediate results.
+
+        Args:
+            [1] means2d: 2D means of rasterized splats, Dim=[K, 2], torch.FloatTensor.
+            [2] conics: inverse of 2D position covariance of rasterized splats, Dim=[K, 3], torch.FloatTensor;
+                        i.e. conics[i] = [1.0 / COV(X, X), 1.0 / COV(X, Y), 1.0 / COV(Y, Y)].
+            [3] opacities: opacity of rasterized splats, Dim=[K], torch.FloatTensor.
+            [4] img_height: height of input image, int.
+            [5] image_width: width of input image, int.
+            [6] tile_size: tile size, int.
+            [7] isect_offsets: offsets of intersection between splats and tiles, Dim=[H/tile_size, W/tile_size], torch.LongTensor.
+                        i.e. tile (i, j) intersects with splats,
+                             isect_start = insect_offsets[i, j], isect_end = isect_offsets[i, j + 1]
+                             thus, intersected splats indices = flatten_ids[isect_start:isect_end]
+            [8] flatten_ids: flattened indices of splats, Dim=[M], torch.LongTensor.
+
+        Returns:
+            [1] tile_to_alpha_cache: tile index to alpha-blending cache, Dict.
+                tile_to_alpha_cache[tile_y * tile_width + tile_x] = {
+                    "image_index": image index,
+                    "tile_x": tile column index,
+                    "tile_y": tile row index,
+                    "tile_width": tile width,
+                    "tile_height": tile height,
+                    "tile_size": tile size,
+                    "splat_indices": intersected splats' indices, Dim=[tK], torch.LongTensor,
+                    "splat_alphas": pixelwise alphas i.e. gaussian-weighted opacities of each splat, Dim=[tK, tile_size, tile_size], torch.LongTensor,
+                    "blend_alphas": depth-sorted cumulative product alphas of each splat, Dim=[tK, tile_size, tile_size], torch.FloatTensor.
+                }
+        """
+        tile_height = int(np.ceil(img_height / tile_size))
+        tile_width = int(np.ceil(img_width / tile_size))
+        assert isect_offsets.shape[1:] == (tile_height, tile_width)
+
+        device = means2d.device
+
+        xs, ys = torch.meshgrid(
+            [torch.arange(tile_size), torch.arange(tile_size)], indexing="xy"
+        )
+        xs, ys = xs.to(device).float(), ys.to(device).float()
+
+        num_imgs = isect_offsets.shape[0]
+
+        isect_offsets = isect_offsets.flatten()
+
+        for img_idx in range(num_imgs):
+            tile_to_alpha_cache = {}
+            for tile_y in range(tile_height):
+                for tile_x in range(tile_width):
+                    tile_idx = (img_idx * tile_height * tile_width) + (
+                        tile_y * tile_width + tile_x
+                    )
+
+                    isect_start = isect_offsets[tile_idx]
+                    isect_end = (
+                        isect_offsets[tile_idx + 1]
+                        if tile_idx < len(isect_offsets) - 1
+                        else len(flatten_ids)
+                    )
+
+                    if isect_start >= isect_end:
+                        continue
+
+                    flat_idxs = flatten_ids[isect_start:isect_end]
+
+                    tile_xs = xs + tile_size * tile_x + 0.5
+                    tile_ys = ys + tile_size * tile_y + 0.5
+
+                    tile_means2d = means2d[flat_idxs]  # Dim = [tK, 2]
+                    tile_conics = conics[flat_idxs]  # Dim = [tK, 3]
+                    tile_opacities = opacities[flat_idxs]  # Dim = [tK]
+
+                    tile_xs = (
+                        tile_xs - tile_means2d[:, 0][:, None, None]
+                    )  # Dim = [tK, tile_size, tile_size]
+                    tile_ys = (
+                        tile_ys - tile_means2d[:, 1][:, None, None]
+                    )  # Dim = [tK, tile_size, tile_size]
+
+                    tile_sigmas = 0.5 * (
+                        tile_xs * tile_xs * tile_conics[:, 0][:, None, None]
+                        + tile_ys * tile_ys * tile_conics[:, 2][:, None, None]
+                        + 2.0 * tile_xs * tile_ys * tile_conics[:, 1][:, None, None]
+                    )  # Dim = [tK, tile_size, tile_size]
+
+                    splat_alphas = torch.clamp_max(
+                        tile_opacities[:, None, None] * torch.exp(-tile_sigmas), 0.9999
+                    )  # Dim = [tK, tile_size, tile_size]
+
+                    blend_alphas = torch.cumprod(1.0 - splat_alphas, dim=0)
+                    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=0)
+                    blend_alphas[0, :, :] = 1.0
+
+                    tile_to_alpha_cache[tile_idx] = {
+                        "image_index": img_idx,
+                        "tile_x": tile_x,
+                        "tile_y": tile_y,
+                        "tile_width": tile_width,
+                        "tile_height": tile_height,
+                        "tile_size": tile_size,
+                        "splat_indices": flat_idxs,
+                        "splat_alphas": splat_alphas,
+                        "blend_alphas": blend_alphas,
+                    }
+        return tile_to_alpha_cache
+
+    @staticmethod
+    def _cache_sh_colors(
+        means3d: torch.FloatTensor,
+        view_mats: torch.FloatTensor,
+        sh_coeffs: torch.FloatTensor,
+        radii: torch.FloatTensor,
+    ):
+        """Cache view-dependent spherical harmonics colors.
+
+        Args:
+            [1] means3d: 3D means of rasterized splats, Dim=[K, 3], torch.FloatTensor.
+            [2] view_mats: view matrices, Dim=[N, 4, 4], torch.FloatTensor.
+            [3] sh_coeffs: spherical harmonics coefficients of rasterized splats, Dim=[K, (L + 1)^2, 3], torch.FloatTensor.
+            [4] radii: radiuses of rasterized 2D splats, Dim=[K], torch.FloatTensor.
+
+        Returns:
+            [1] sh_colors_cache: spherical integrated colors of each splat, Dim=[K, 3], torch.FloatTensor.
+        """
+        n = len(view_mats)
+
+        view_dirs = (
+            means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
+        )  # Dim = [N, K, 3]
+        view_masks = (radii > 0).all(dim=-1)[None].repeat([n, 1])  # Dim = [N, K]
+        sh_colors_cache = spherical_harmonics(
+            degrees_to_use=int(np.sqrt(sh_coeffs.shape[-2])) - 1,
+            dirs=view_dirs,  # Dim = [N, K, 3]
+            coeffs=sh_coeffs[None].repeat([n, 1, 1, 1]),  # Dim = [N, K, (L + 1)^2, 3]
+            masks=view_masks,  # Dim = [N, K]
+        )  # [N, K, 3]
+        sh_colors_cache = torch.clamp_min(sh_colors_cache + 0.5, 0.0)
+        return sh_colors_cache
+
     def _backward_render_to_position(
         self, rd_imgs: torch.FloatTensor, splats: Dict[str, torch.FloatTensor]
     ):
@@ -663,7 +661,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             G(k, m, n) is the 3D gaussian weight if pixel (m, n) located at k-th splat's tile
             σ(k) is the k-th splat's opacity
             SH(r(k), sh_coeffs(k)) is the k-th splat's spherical harmonic integrated color from view r(k)
-        
+
         for pixel (m, n):
             ∂(RGB) / ∂(SH(k)) = G(k, m, n) * σ(k) * MULTIPLY_j(1.0 - G(j, m, n) * σ(j)))
         """

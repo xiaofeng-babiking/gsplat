@@ -15,12 +15,11 @@ from collections import namedtuple
 from typing import OrderedDict, Optional
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
-from gsplat.rendering import rasterization, spherical_harmonics, rasterize_to_pixels
+from gsplat.rendering import rasterization, rasterize_to_pixels
 from gsplat.logger import create_logger
 from gsplat.optimizers.sparse_newton import (
     GroupSSIMLoss,
     GSGroupNewtonOptimizer,
-    raster_to_pixels_torch,
 )
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
@@ -331,92 +330,149 @@ def test_render_color_forward():
     """Test backward pass of spherical harmonics color."""
     data, splats = generate_render_data_sample(batch_mode=False)
 
-    gt_imgs = data.groundtruth_image.contiguous()
-    # rd_imgs = data.render_image.contiguous()
+    rd_imgs = data.render_image.contiguous()
     rd_metas = data.render_metadata
-    # cam_mats = data.camera_matrix.contiguous()
     view_mats = data.view_matrix.contiguous()
 
-    n_cams = gt_imgs.shape[0]
+    n_cams = rd_imgs.shape[0]
     cam_idx = random.choice(list(range(n_cams)))
 
-    view_mat = view_mats[cam_idx]
+    rd_img = rd_imgs[cam_idx][None].permute(0, 2, 3, 1)  # NCHW -> NHWC
+    device = rd_img.device
+
+    view_mat = view_mats[cam_idx][None]  # [1, 4, 4]
 
     rd_meta = rd_metas[cam_idx]
-
-    gt_img = gt_imgs[cam_idx]
-    img_h, img_w, _ = gt_img.shape
-
     n_splats = len(rd_meta["means2d"])
 
-    gauss_idxs = rd_meta["gaussian_ids"]
+    gauss_ids = rd_meta["gaussian_ids"]
+    means3d = splats["means"][gauss_ids]
+    sh_coeffs = torch.cat([splats["sh0"][gauss_ids], splats["shN"][gauss_ids]], dim=1)
+    means2d = rd_meta["means2d"]
+    radii = rd_meta["radii"]
+    opacities = rd_meta["opacities"]
+    conics = rd_meta["conics"]
+    assert (
+        len(means3d)
+        == len(sh_coeffs)
+        == len(means2d)
+        == len(radii)
+        == len(opacities)
+        == len(conics)
+    ), f"Mismatch between number of splats!"
 
-    view_dirs = splats["means"][gauss_idxs] - torch.linalg.inv(view_mat)[:3, 3][None]
-    view_masks = (rd_meta["radii"] > 0).all(dim=-1)
-    sh_coeffs = torch.cat([splats["sh0"][gauss_idxs], splats["shN"][gauss_idxs]], dim=1)
-    rd_colors = spherical_harmonics(
-        degrees_to_use=int(np.sqrt(sh_coeffs.shape[-2])) - 1,
-        dirs=view_dirs,
-        coeffs=sh_coeffs,
-        masks=view_masks,
-    )
-    rd_colors = torch.clamp_min(rd_colors + 0.5, 0.0)
-
+    img_h = rd_meta["height"]
+    img_w = rd_meta["width"]
     tile_size = rd_meta["tile_size"]
-    tile_h = int(np.ceil(rd_meta["height"] / tile_size))
-    assert tile_h == rd_meta["tile_height"]
-    tile_w = int(np.ceil(rd_meta["width"] / tile_size))
-    assert tile_w == rd_meta["tile_width"]
-
-    isect_offsets = rd_meta["isect_offsets"][0].flatten()
-    assert len(isect_offsets) == tile_h * tile_w
-
-    assert len(torch.unique(rd_meta["flatten_ids"])) == len(rd_meta["means2d"])
+    isect_offsets = rd_meta["isect_offsets"]
+    flatten_ids = rd_meta["flatten_ids"]
 
     start = time.time()
-    rd_img, rd_alphas = rasterize_to_pixels(
-        means2d=rd_meta["means2d"],
-        conics=rd_meta["conics"],
-        colors=rd_colors,
-        opacities=rd_meta["opacities"],
-        image_height=rd_meta["height"],
-        image_width=rd_meta["width"],
-        tile_size=rd_meta["tile_size"],
-        isect_offsets=rd_meta["isect_offsets"],
-        flatten_ids=rd_meta["flatten_ids"],
+    sh_colors_cache = GSGroupNewtonOptimizer._cache_sh_colors(
+        means3d=means3d,
+        view_mats=view_mat,
+        sh_coeffs=sh_coeffs,
+        radii=radii,
+    )
+    end = time.time()
+    sh_deg = int(np.sqrt(sh_coeffs.shape[-2])) - 1
+    sh_colors_cache_elapsed = float(end - start)
+    LOGGER.info(
+        f"SH-Colors-Cache #Splats={len(means3d)}, SH-Degree={sh_deg}, Elapsed={sh_colors_cache_elapsed:.6f} seconds."
+    )
+
+    start = time.time()
+    cuda_img, cuda_alphas = rasterize_to_pixels(
+        means2d=means2d,
+        conics=conics,
+        colors=sh_colors_cache[0],
+        opacities=opacities,
+        image_height=img_h,
+        image_width=img_w,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
         packed=True,
     )
+    cuda_img = torch.clamp(cuda_img, min=0.0, max=1.0)
     end = time.time()
     cuda_elapsed = float(end - start)
     LOGGER.info(
         f"CUDA #Splats={n_splats}, Image={img_w}x{img_h}, Elapsed={cuda_elapsed:.6f} seconds."
     )
+    assert torch.allclose(cuda_img, rd_img, atol=1e-4, rtol=1e-6)
 
     start = time.time()
-    fwd_img, fwd_alphas = raster_to_pixels_torch(
-        means2d=rd_meta["means2d"],
-        conics=rd_meta["conics"],
-        colors=rd_colors,
-        opacities=rd_meta["opacities"],
-        image_height=rd_meta["height"],
-        image_width=rd_meta["width"],
-        tile_size=rd_meta["tile_size"],
-        isect_offsets=rd_meta["isect_offsets"],
-        flatten_ids=rd_meta["flatten_ids"],
-        packed=True,
+    tile_to_alpha_cache = GSGroupNewtonOptimizer._cache_tile_to_splats_alphas(
+        means2d=means2d,
+        conics=conics,
+        opacities=opacities,
+        img_height=img_h,
+        img_width=img_w,
+        tile_size=tile_size,
+        isect_offsets=isect_offsets,
+        flatten_ids=flatten_ids,
     )
+    end = time.time()
+    tile_to_alpha_cache_elapsed = float(end - start)
+    LOGGER.info(
+        f"Tile-to-Alpha-Cache #Splats={n_splats}, Elapsed={tile_to_alpha_cache_elapsed:.6f} seconds"
+    )
+
+    start = time.time()
+    n_imgs = sh_colors_cache.shape[0]
+    torch_img = torch.zeros(
+        size=[n_imgs, img_h, img_w, 3], device=device, dtype=torch.float32
+    )
+    torch_alphas = torch.zeros(
+        size=[n_imgs, img_h, img_w, 1], device=device, dtype=torch.float32
+    )
+
+    for _, tile_meta in tile_to_alpha_cache.items():
+        img_idx = tile_meta["image_index"]
+        tile_x = tile_meta["tile_x"]
+        tile_y = tile_meta["tile_y"]
+        tile_size = tile_meta["tile_size"]
+        splat_idxs = tile_meta["splat_indices"]
+        splat_alphas = tile_meta["splat_alphas"]
+        blend_alphas = tile_meta["blend_alphas"]
+
+        tile_img = torch.sum(
+            splat_alphas[:, :, :, None]  # [tK, tile_size, tile_size, 1]
+            * blend_alphas[:, :, :, None]  # [tK, tile_size, tile_size, 1]
+            * sh_colors_cache[img_idx, splat_idxs, :][
+                :, None, None, :
+            ],  # [tK, 1, 1, 3]
+            dim=0,
+        )
+        tile_alphas = 1.0 - blend_alphas[-1, :, :, None]
+
+        paste_xmin = tile_x * tile_size
+        paste_width = min(tile_size, img_w - paste_xmin)
+        paste_ymin = tile_y * tile_size
+        paste_height = min(tile_size, img_h - paste_ymin)
+
+        torch_img[
+            img_idx,
+            paste_ymin : paste_ymin + paste_height,
+            paste_xmin : paste_xmin + paste_width,
+            :,
+        ] = tile_img[:paste_height, :paste_width, :]
+        torch_alphas[
+            img_idx,
+            paste_ymin : paste_ymin + paste_height,
+            paste_xmin : paste_xmin + paste_width,
+            :,
+        ] = tile_alphas[:paste_height, :paste_width, :]
+
+    torch_img = torch.clamp(torch_img, min=0.0, max=1.0)
     end = time.time()
     torch_elapsed = float(end - start)
     LOGGER.info(
-        f"Torch #Splats={n_splats}, Elapsed={torch_elapsed:.6f} seconds"
-        + f"(Slower={(torch_elapsed / cuda_elapsed):.4f})"
+        f"Torch #Splats={n_splats}, Image={img_w}x{img_h}, "
+        + f"Elapsed={torch_elapsed:.6f} seconds ({torch_elapsed / cuda_elapsed:.4f} slower)."
     )
 
-    assert not torch.isinf(fwd_img).any()
-    assert not torch.isnan(fwd_img).any()
-
-    rd_img = torch.clamp(rd_img, min=0.0, max=1.0)
-    fwd_img = torch.clamp(fwd_img, min=0.0, max=1.0)
     ssim_measure = StructuralSimilarityIndexMeasure(
         data_range=1.0,
         kernel_size=11,
@@ -424,16 +480,16 @@ def test_render_color_forward():
         k2=0.03,
         sigma=1.5,
         reduction="none",
-    ).to(rd_img.device)
+    ).to(device)
     rgb_ssim_metric = (
-        ssim_measure(rd_img.permute([0, 3, 1, 2]), fwd_img.permute([0, 3, 1, 2]))
+        ssim_measure(cuda_img.permute([0, 3, 1, 2]), torch_img.permute([0, 3, 1, 2]))
         .mean()
         .item()
     )
-    rgb_l2_metric = torch.linalg.norm(rd_img - fwd_img, dim=-1).mean().item()
+    rgb_l2_metric = torch.linalg.norm(cuda_img - torch_img, dim=-1).mean().item()
     assert rgb_ssim_metric > 0.99 and rgb_l2_metric < 0.005
 
-    alpha_mean_err = torch.abs(rd_alphas - fwd_alphas).mean().item()
+    alpha_mean_err = torch.abs(cuda_alphas - torch_alphas).mean().item()
     assert alpha_mean_err < 0.003
 
 
