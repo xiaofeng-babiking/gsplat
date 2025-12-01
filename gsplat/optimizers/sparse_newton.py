@@ -494,6 +494,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
     @staticmethod
     def _cache_tile_to_splats_alphas(
+        gauss_ids: torch.LongTensor,
         means2d: torch.FloatTensor,
         conics: torch.FloatTensor,
         opacities: torch.FloatTensor,
@@ -506,28 +507,30 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         """Cache splats-to-pixels alpha-blending intermediate results.
 
         Args:
-            [1] means2d: 2D means of rasterized splats, Dim=[K, 2], torch.FloatTensor.
-            [2] conics: inverse of 2D position covariance of rasterized splats, Dim=[K, 3], torch.FloatTensor;
+            [1] gauss_ids: global splat indices, Dim=[K], torch.LongTensor.
+            [2] means2d: 2D means of rasterized splats, Dim=[K, 2], torch.FloatTensor.
+            [3] conics: inverse of 2D position covariance of rasterized splats, Dim=[K, 3], torch.FloatTensor;
                         i.e. conics[i] = [1.0 / COV(X, X), 1.0 / COV(X, Y), 1.0 / COV(Y, Y)].
-            [3] opacities: opacity of rasterized splats, Dim=[K], torch.FloatTensor.
-            [4] img_height: height of input image, int.
-            [5] image_width: width of input image, int.
-            [6] tile_size: tile size, int.
-            [7] isect_offsets: offsets of intersection between splats and tiles, Dim=[H/tile_size, W/tile_size], torch.LongTensor.
+            [4] opacities: opacity of rasterized splats, Dim=[K], torch.FloatTensor.
+            [5] img_height: height of input image, int.
+            [6] image_width: width of input image, int.
+            [7] tile_size: tile size, int.
+            [8] isect_offsets: offsets of intersection between splats and tiles, Dim=[H/tile_size, W/tile_size], torch.LongTensor.
                         i.e. tile (i, j) intersects with splats,
                              isect_start = insect_offsets[i, j], isect_end = isect_offsets[i, j + 1]
                              thus, intersected splats indices = flatten_ids[isect_start:isect_end]
-            [8] flatten_ids: flattened indices of splats, Dim=[M], torch.LongTensor.
+            [9] flatten_ids: flattened indices of splats, Dim=[M], torch.LongTensor.
 
         Returns:
-            [1] tile_to_alpha_cache: tile index to alpha-blending cache, Dict.
-                tile_to_alpha_cache[tile_y * tile_width + tile_x] = {
+            [1] tile_to_alphas_cache: tile index to alpha-blending cache, Dict.
+                tile_to_alphas_cache[tile_y * tile_width + tile_x] = {
                     "image_index": image index,
                     "tile_x": tile column index,
                     "tile_y": tile row index,
                     "tile_width": tile width,
                     "tile_height": tile height,
                     "tile_size": tile size,
+                    "splat_ids": intersected splats' global ids, Dim=[tK], torch.LongTensor,
                     "splat_indices": intersected splats' indices, Dim=[tK], torch.LongTensor,
                     "splat_alphas": pixelwise alphas i.e. gaussian-weighted opacities of each splat, Dim=[tK, tile_size, tile_size], torch.LongTensor,
                     "blend_alphas": depth-sorted cumulative product alphas of each splat, Dim=[tK, tile_size, tile_size], torch.FloatTensor.
@@ -549,7 +552,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         isect_offsets = isect_offsets.flatten()
 
         for img_idx in range(num_imgs):
-            tile_to_alpha_cache = {}
+            tile_to_alphas_cache = {}
             for tile_y in range(tile_height):
                 for tile_x in range(tile_width):
                     tile_idx = (img_idx * tile_height * tile_width) + (
@@ -567,6 +570,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                         continue
 
                     flat_idxs = flatten_ids[isect_start:isect_end]
+
+                    splat_ids = gauss_ids[flat_idxs]
 
                     tile_xs = xs + tile_size * tile_x + 0.5
                     tile_ys = ys + tile_size * tile_y + 0.5
@@ -596,18 +601,19 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
                     blend_alphas = torch.roll(blend_alphas, shifts=1, dims=0)
                     blend_alphas[0, :, :] = 1.0
 
-                    tile_to_alpha_cache[tile_idx] = {
+                    tile_to_alphas_cache[tile_idx] = {
                         "image_index": img_idx,
                         "tile_x": tile_x,
                         "tile_y": tile_y,
                         "tile_width": tile_width,
                         "tile_height": tile_height,
                         "tile_size": tile_size,
+                        "splat_ids": splat_ids,
                         "splat_indices": flat_idxs,
                         "splat_alphas": splat_alphas,
                         "blend_alphas": blend_alphas,
                     }
-        return tile_to_alpha_cache
+        return tile_to_alphas_cache
 
     @staticmethod
     def _cache_sh_colors(
@@ -625,7 +631,7 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             [4] radii: radiuses of rasterized 2D splats, Dim=[K], torch.FloatTensor.
 
         Returns:
-            [1] sh_colors_cache: spherical integrated colors of each splat, Dim=[K, 3], torch.FloatTensor.
+            [1] sh_colors_cache: spherical integrated colors of each splat, Dim=[N, K, 3], torch.FloatTensor.
         """
         n = len(view_mats)
 
@@ -648,10 +654,11 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         """Backward pass of rendered pixels w.r.t splats' positions."""
         pass
 
-    def _backward_render_to_sh_color(
+    def _backward_render_to_sh_color_tile(
         self,
-        rd_imgs: torch.FloatTensor,
-        rd_meta: Dict[str, torch.FloatTensor],
+        num_color_channels: int,
+        tile_to_alphas_cache: Dict[str, torch.FloatTensor],
+        with_hessian: bool = False,
     ):
         """Backward pass of rendered pixels w.r.t spherical harmonics colors.
 
@@ -664,11 +671,65 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         for pixel (m, n):
             ∂(RGB) / ∂(SH(k)) = G(k, m, n) * σ(k) * MULTIPLY_j(1.0 - G(j, m, n) * σ(j)))
-        """
-        pass
 
-    def _backward_sh_color_to_position(
-        self, rd_imgs: torch.FloatTensor, rd_meta: Dict[str, torch.FloatTensor]
+        Args:
+            [1] tile_to_alphas_cache: cache of tile indices and their alphas, Dict.
+            [2] with_hessian: bool, whether to compute the Hessian matrix.
+
+        Returns:
+            [1] sparse_splat: the sparse gaussian splats indices, Dict.
+                    i.e. sparse_splat[(image_index, tile_x, tile_y)] = splat_ids, Dim=[tK], torch.LongTensor.
+            [2] sparse_jacob: the Jacobian matrix of backward pass, Dict.
+                    i.e. sparse_jacob[(image_index, tile_x, tile_y)] = jacobian, Dim=[tile_size, tile_size, tK, 3], torch.FloatTensor.
+            [2] sparse_hess: the Hessian matrix of backward pass, Dict.
+                    i.e. sparse_hessian[(image_index, tile_x, tile_y)] = hessian, Dim=[tile_size, tile_size, tK, tK, 3], torch.FloatTensor.
+        """
+        sparse_splat = {}
+        sparse_jacob = {}
+        sparse_hess = {}
+        for _, tile_meta in tile_to_alphas_cache.items():
+            img_idx = tile_meta["image_index"]
+            tile_x = tile_meta["tile_x"]
+            tile_y = tile_meta["tile_y"]
+            # tile_size = tile_meta["tile_size"]
+            splat_ids = tile_meta["splat_ids"]
+            splat_alphas = tile_meta["splat_alphas"]
+            blend_alphas = tile_meta["blend_alphas"]
+
+            tile_jacob = (splat_alphas * blend_alphas)[:, :, :, None].repeat(
+                [1, 1, 1, num_color_channels]
+            )  # Dim = [tK, tile_size, tile_size, 3]
+            tile_jacob = tile_jacob.permute(
+                [1, 2, 0, 3]
+            )  # Dim = [tile_size, tile_size, tK, 3]
+
+            key = (img_idx, tile_x, tile_y)
+            sparse_splat[key] = splat_ids
+            sparse_jacob[key] = tile_jacob
+            sparse_hess[key] = None  # Hessian here always equals to 0.0
+        return sparse_splat, sparse_jacob, sparse_hess
+
+    def _backward_render_to_gaussian_kernel(
+        self,
+        sh_colors_cache: Dict[int, Dict[str, torch.FloatTensor]],
+        tile_to_alphas_cache: Dict[int, Dict[str, torch.FloatTensor]],
+        with_hessian: bool = False,
     ):
-        """"""
+        """
+
+        RGB = SUM_k(G(k, m, n) * σ(k) * SH(r(k), sh_coeffs(k)) * MULTIPLY_j(1.0 - G(j, m, n) * σ(j)))
+
+        For pixel (m, n):
+            k = 0, G(0) * σ(0) * SH(0) * 1.0
+            k = 1, G(1) * σ(1) * SH(1) * (1.0 - G(0) * σ(0))
+            k = 2, G(2) * σ(2) * SH(2) * (1.0 - G(1) * σ(1)) * (1.0 - G(0) * σ(0))
+            k = 3, G(3) * σ(3) * SH(3) * (1.0 - G(2) * σ(2)) * (1.0 - G(1) * σ(1)) * (1.0 - G(0) * σ(0))
+        
+        ∂(RGB) / ∂(G(0)) = 
+              1.0  * σ(0) * SH(0)
+            - G(1) * σ(1) * SH(1) * 1.0
+            - G(2) * σ(2) * SH(2) * (1.0 - G(1) * σ(1))
+            - G(3) * σ(3) * SH(3) * (1.0 - G(2) * σ(2)) * (1.0 - G(1) * σ(1))
+            - ...
+        """
         pass

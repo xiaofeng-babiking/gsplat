@@ -403,7 +403,8 @@ def test_render_color_forward():
     assert torch.allclose(cuda_img, rd_img, atol=1e-4, rtol=1e-6)
 
     start = time.time()
-    tile_to_alpha_cache = GSGroupNewtonOptimizer._cache_tile_to_splats_alphas(
+    tile_to_alphas_cache = GSGroupNewtonOptimizer._cache_tile_to_splats_alphas(
+        gauss_ids=gauss_ids,
         means2d=means2d,
         conics=conics,
         opacities=opacities,
@@ -428,7 +429,7 @@ def test_render_color_forward():
         size=[n_imgs, img_h, img_w, 1], device=device, dtype=torch.float32
     )
 
-    for _, tile_meta in tile_to_alpha_cache.items():
+    for _, tile_meta in tile_to_alphas_cache.items():
         img_idx = tile_meta["image_index"]
         tile_x = tile_meta["tile_x"]
         tile_y = tile_meta["tile_y"]
@@ -468,8 +469,13 @@ def test_render_color_forward():
     torch_img = torch.clamp(torch_img, min=0.0, max=1.0)
     end = time.time()
     torch_elapsed = float(end - start)
+
+    n_splats_per_tile = np.mean(
+        [v["splat_indices"].shape[0] for v in tile_to_alphas_cache.values()]
+    )
     LOGGER.info(
         f"Torch #Splats={n_splats}, Image={img_w}x{img_h}, "
+        + f"#SplatsPerTile={n_splats_per_tile:.4f}, TileSize={tile_size}, "
         + f"Elapsed={torch_elapsed:.6f} seconds ({torch_elapsed / cuda_elapsed:.4f} slower)."
     )
 
