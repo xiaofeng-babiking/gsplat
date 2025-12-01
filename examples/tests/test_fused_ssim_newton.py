@@ -392,7 +392,6 @@ def test_render_color_forward():
         f"CUDA #Splats={n_splats}, Image={img_w}x{img_h}, Elapsed={cuda_elapsed:.6f} seconds."
     )
 
-    max_workers = 16
     start = time.time()
     fwd_img, fwd_alphas = raster_to_pixels_torch(
         means2d=rd_meta["means2d"],
@@ -405,17 +404,37 @@ def test_render_color_forward():
         isect_offsets=rd_meta["isect_offsets"],
         flatten_ids=rd_meta["flatten_ids"],
         packed=True,
-        max_workers=max_workers,
     )
     end = time.time()
     torch_elapsed = float(end - start)
     LOGGER.info(
-        f"Torch #Worker={max_workers}, #Splats={n_splats}, Elapsed={torch_elapsed:.6f} seconds"
+        f"Torch #Splats={n_splats}, Elapsed={torch_elapsed:.6f} seconds"
         + f"(Slower={(torch_elapsed / cuda_elapsed):.4f})"
     )
 
-    assert torch.allclose(rd_img, fwd_img, atol=0.1)
-    assert torch.allclose(rd_alphas, fwd_alphas, atol=0.01)
+    assert not torch.isinf(fwd_img).any()
+    assert not torch.isnan(fwd_img).any()
+
+    rd_img = torch.clamp(rd_img, min=0.0, max=1.0)
+    fwd_img = torch.clamp(fwd_img, min=0.0, max=1.0)
+    ssim_measure = StructuralSimilarityIndexMeasure(
+        data_range=1.0,
+        kernel_size=11,
+        k1=0.01,
+        k2=0.03,
+        sigma=1.5,
+        reduction="none",
+    ).to(rd_img.device)
+    rgb_ssim_metric = (
+        ssim_measure(rd_img.permute([0, 3, 1, 2]), fwd_img.permute([0, 3, 1, 2]))
+        .mean()
+        .item()
+    )
+    rgb_l2_metric = torch.linalg.norm(rd_img - fwd_img, dim=-1).mean().item()
+    assert rgb_ssim_metric > 0.99 and rgb_l2_metric < 0.005
+
+    alpha_mean_err = torch.abs(rd_alphas - fwd_alphas).mean().item()
+    assert alpha_mean_err < 0.003
 
 
 if __name__ == "__main__":

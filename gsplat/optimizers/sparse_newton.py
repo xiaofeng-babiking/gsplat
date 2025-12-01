@@ -256,7 +256,6 @@ def raster_to_pixels_torch(
     isect_offsets: torch.LongTensor,
     flatten_ids: torch.LongTensor,
     packed: bool = True,
-    max_workers: int = 32,
 ):
     """Raster to render pixel space based on tiles.
 
@@ -664,6 +663,9 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             G(k, m, n) is the 3D gaussian weight if pixel (m, n) located at k-th splat's tile
             σ(k) is the k-th splat's opacity
             SH(r(k), sh_coeffs(k)) is the k-th splat's spherical harmonic integrated color from view r(k)
+        
+        for pixel (m, n):
+            ∂(RGB) / ∂(SH(k)) = G(k, m, n) * σ(k) * MULTIPLY_j(1.0 - G(j, m, n) * σ(j)))
         """
         pass
 
