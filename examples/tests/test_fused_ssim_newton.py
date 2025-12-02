@@ -378,7 +378,7 @@ def test_render_color_forward():
     sh_deg = int(np.sqrt(sh_coeffs.shape[-2])) - 1
     sh_colors_cache_elapsed = float(end - start)
     LOGGER.info(
-        f"SH-Colors-Cache #Splats={len(means3d)}, SH-Degree={sh_deg}, Elapsed={sh_colors_cache_elapsed:.6f} seconds."
+        f"SH-Colors-Cache #Splats={len(torch.unique(gauss_ids))}, SH-Degree={sh_deg}, Elapsed={sh_colors_cache_elapsed:.6f} seconds."
     )
 
     start = time.time()
@@ -403,7 +403,7 @@ def test_render_color_forward():
     assert torch.allclose(cuda_img, rd_img, atol=1e-4, rtol=1e-6)
 
     start = time.time()
-    tile_to_alphas_cache = GSGroupNewtonOptimizer._cache_tile_to_splats_alphas(
+    tile_to_alphas_cache = GSGroupNewtonOptimizer._cache_tile_to_splat_alphas(
         gauss_ids=gauss_ids,
         means2d=means2d,
         conics=conics,
@@ -434,14 +434,14 @@ def test_render_color_forward():
         tile_x = tile_meta["tile_x"]
         tile_y = tile_meta["tile_y"]
         tile_size = tile_meta["tile_size"]
-        splat_idxs = tile_meta["splat_indices"]
-        splat_alphas = tile_meta["splat_alphas"]
+        tile_splat_idxs = tile_meta["tile_splat_indices"]
+        tile_alphas = tile_meta["tile_alphas"]
         blend_alphas = tile_meta["blend_alphas"]
 
         tile_img = torch.sum(
-            splat_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+            tile_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
             * blend_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
-            * sh_colors_cache[img_idx, splat_idxs, :][
+            * sh_colors_cache[img_idx, tile_splat_idxs, :][
                 None, None, :, :
             ],  # [1, 1, tK, 3]
             dim=-2,
@@ -471,7 +471,7 @@ def test_render_color_forward():
     torch_elapsed = float(end - start)
 
     n_splats_per_tile = np.mean(
-        [v["splat_indices"].shape[0] for v in tile_to_alphas_cache.values()]
+        [v["tile_splat_indices"].shape[0] for v in tile_to_alphas_cache.values()]
     )
     LOGGER.info(
         f"Torch #Splats={n_splats}, Image={img_w}x{img_h}, "
