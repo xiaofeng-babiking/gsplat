@@ -269,22 +269,21 @@ def test_fused_ssim_backward():
 
     gt_imgs = data.groundtruth_image.contiguous()
     rd_imgs = data.render_image.contiguous()
-    rd_imgs.requires_grad = True
-
+    
     device = gt_imgs.device
 
-    ssim_loss = fused_ssim(rd_imgs, gt_imgs, padding="valid")
-    ssim_loss.require_grad = True
+    ssim_loss_func = lambda rd_imgs: fused_ssim(rd_imgs, gt_imgs, padding="valid")
 
     start = time.time()
-    ssim_loss.backward()
+    torch_jacob = torch.autograd.functional.jacobian(
+        ssim_loss_func, rd_imgs, vectorize=False, create_graph=True
+    )
+    # NOTE. OOM Dim -> [N, H, W, C, 3]^2
+    # torch_hess = torch.autograd.functional.hessian(
+    #     ssim_loss_func, rd_imgs, vectorize=False, create_graph=True
+    # )
     end = time.time()
     torch_elapsed = float(end - start)
-    torch_jacob = rd_imgs.grad.clone().cpu().detach().numpy()
-
-    rd_imgs = rd_imgs.data.clone().detach()
-    rd_imgs.requires_grad = False
-    rd_imgs.grad = None
     torch.cuda.empty_cache()
 
     filter = parse_fused_ssim_gauss_filter_1d().to(device)
@@ -294,28 +293,21 @@ def test_fused_ssim_backward():
     )
     end = time.time()
     group_elapsed = float(end - start)
-    group_jacob = group_jacob.cpu().detach().numpy()
 
-    assert not np.any(
-        np.isnan(group_jacob) | np.isinf(group_jacob)
+    assert not torch.any(
+        torch.isnan(group_jacob) | torch.isinf(group_jacob)
     ), "Group SSIM jacobian contains NaN or Inf!"
 
-    if group_hess is not None:
-        group_hess = group_hess.cpu().detach().numpy()
+    assert not torch.any(
+        torch.isnan(group_hess) | torch.isinf(group_hess)
+    ), "Group SSIM jacobian contains NaN or Inf!"
 
-        assert group_hess.shape == group_jacob.shape
-        f"Group SSIM jacobian and hessian shape mismatch!"
-
-        assert not np.any(
-            np.isnan(group_hess) | np.isinf(group_hess)
-        ), "Group SSIM jacobian contains NaN or Inf!"
-
-    torch_jacob *= torch_jacob.size
-    group_jacob *= group_jacob.size
+    torch_jacob *= torch_jacob.numel()
+    group_jacob *= group_jacob.numel()
 
     # SSIMScore = 1 - SSIMSLoss
-    rerr = np.abs(torch_jacob - (-group_jacob)) / np.abs(torch_jacob)
-    bad_rerr_ratio = len(np.where(rerr > 1e-3)[0]) / torch_jacob.size
+    rerr = torch.abs(torch_jacob - (-group_jacob)) / torch.abs(torch_jacob)
+    bad_rerr_ratio = len(torch.where(rerr > 1e-3)[0]) / torch_jacob.numel()
     assert bad_rerr_ratio < 1.5e-2, f"Fused and Group SSIM backward mismatch!"
 
     LOGGER.info(
@@ -510,11 +502,9 @@ def test_backward_render_to_sh_color_tile():
     # Per-tile number of splats ~= 1000
     n_splats = np.random.randint(900, 1200)
 
-    sh_colors = torch.nn.Parameter(
-        torch.rand(size=[n_splats, n_channels], device=device, dtype=torch.float32),
-        requires_grad=True,
+    sh_colors = torch.rand(
+        size=[n_splats, n_channels], device=device, dtype=torch.float32
     )
-
     tile_alphas = torch.rand(
         size=[tile_size, tile_size, n_splats],
         device=device,
@@ -577,6 +567,6 @@ def test_backward_render_to_sh_color_tile():
 
 if __name__ == "__main__":
     test_backward_render_to_sh_color_tile()
+    test_fused_ssim_backward()
     test_render_color_forward()
     test_fused_ssim_forward()
-    test_fused_ssim_backward()
