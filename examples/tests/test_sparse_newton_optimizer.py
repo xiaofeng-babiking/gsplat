@@ -327,7 +327,7 @@ def test_fused_ssim_backward():
 
 
 def test_render_color_forward():
-    """Test backward pass of spherical harmonics color."""
+    """Test pytorch tile-based alpha-blending i.e. forward rendering."""
     data, splats = generate_render_data_sample(batch_mode=False)
 
     rd_imgs = data.render_image.contiguous()
@@ -499,7 +499,84 @@ def test_render_color_forward():
     assert alpha_mean_err < 0.003
 
 
+def test_backward_render_to_sh_color_tile():
+    """Test Backward pass of rendered pixels w.r.t spherical harmonics colors."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    tile_size = 16
+
+    n_channels = 3
+
+    # Per-tile number of splats ~= 1000
+    n_splats = np.random.randint(900, 1200)
+
+    sh_colors = torch.nn.Parameter(
+        torch.rand(size=[n_splats, n_channels], device=device, dtype=torch.float32),
+        requires_grad=True,
+    )
+
+    tile_alphas = torch.rand(
+        size=[tile_size, tile_size, n_splats],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    blend_alphas = torch.cumprod(1.0 - tile_alphas, dim=-1)
+    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
+    blend_alphas[:, :, 0] = 1.0
+
+    alpha_blend_func = lambda colors: torch.sum(
+        tile_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+        * blend_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+        * colors[None, None, :, :],  # [1, 1, tK, 3]
+        dim=-2,
+    )
+
+    start = time.time()
+    tile_jacob, tile_hess = GSGroupNewtonOptimizer._backward_render_to_sh_color_tile(
+        n_channels,
+        tile_alphas.clone().detach(),
+        blend_alphas.clone().detach(),
+        with_hessian=False,
+    )
+    end = time.time()
+    assert tile_hess is None
+    ours_elapsed = float(end - start)
+
+    start = time.time()
+    torch_jacob = torch.autograd.functional.jacobian(
+        alpha_blend_func,
+        sh_colors,
+        vectorize=False,
+        create_graph=True,
+    )
+    end = time.time()
+    torch_jacob_elapsed = float(end - start)
+
+    start = time.time()
+    torch_hess = torch.autograd.functional.hessian(
+        lambda x: alpha_blend_func(x).sum(),
+        sh_colors,
+        vectorize=False,
+        create_graph=True,
+    )
+    assert torch.allclose(torch_hess, torch.zeros_like(torch_hess))
+    end = time.time()
+    torch_hess_elapsed = float(end - start)
+    LOGGER.info(
+        f"#Splats={n_splats}, TileSize={tile_size}, OursJ={ours_elapsed:.6f} secs, TorchJ={torch_jacob_elapsed:.6f} secs, TorchH={torch_hess_elapsed:.6f} secs."
+    )
+
+    rgb_idxs = [0, 1, 2]
+    torch_jacob = torch_jacob.permute(
+        [0, 1, 3, 2, 4]
+    )  # [tile_size, tile_size, 3, tK, 3] -> [tile_size, tile_size, tK, 3]
+    torch_jacob = torch_jacob[:, :, :, rgb_idxs, rgb_idxs]
+    assert torch.allclose(tile_jacob, torch_jacob)
+
+
 if __name__ == "__main__":
+    test_backward_render_to_sh_color_tile()
     test_render_color_forward()
     test_fused_ssim_forward()
     test_fused_ssim_backward()

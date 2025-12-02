@@ -658,8 +658,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
     @staticmethod
     def _backward_render_to_sh_color_tile(
         n_channels: int,
-        tile_x: int,
-        tile_y: int,
         tile_alphas: int,
         blend_alphas: int,
         with_hessian: bool = False,
@@ -668,12 +666,9 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         Args:
             [1] n_channels: Number of color channels, int.
-            [2] tile_x: int, Tile column index, int.
-            [3] tile_y: int, Tile row index, int.
-            [4] tile_size: Tile size, int.
-            [5] tile_alphas: Pixelwise alphas within a tile, Dim=[tile_size, tile_size, tK].
-            [6] blend_alphas: Pixelwise blended alphas within a tile, Dim=[tile_size, tile_size, tK], torch.FloatTensor.
-            [7] with_hessian: Whether to compute the Hessian matrix, bool.
+            [2] tile_alphas: Pixelwise alphas within a tile, Dim=[tile_size, tile_size, tK].
+            [3] blend_alphas: Pixelwise blended alphas within a tile, Dim=[tile_size, tile_size, tK], torch.FloatTensor.
+            [4] with_hessian: Whether to compute the Hessian matrix, bool.
 
         Returns:
             [1] tile_jacob: Jacobian matrix, Dim=[tile_size, tile_size, tK, 3], torch.FloatTensor.
