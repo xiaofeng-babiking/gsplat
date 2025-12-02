@@ -8,6 +8,51 @@ from typing import Dict, Any, Optional, Literal, Tuple
 from gsplat.rendering import spherical_harmonics
 
 
+def compute_kernel_mean_2d(img: torch.FloatTensor, kernel: torch.FloatTensor):
+    """Compute 2D kernel-weighted mean of an image."""
+    c = img.shape[1]
+
+    mean = torch.conv2d(
+        img,
+        torch.tile(kernel, (c, 1, 1, 1)),
+        stride=1,
+        padding="same",
+        groups=c,
+    )
+    return mean
+
+
+def compute_kernel_covariance_2d(
+    img0: torch.FloatTensor,
+    mean_0: Optional[torch.FloatTensor] = None,
+    img1: Optional[torch.FloatTensor] = None,
+    mean_1: Optional[torch.FloatTensor] = None,
+    kernel: Optional[torch.FloatTensor] = None,
+):
+    """Compute covariance between two images."""
+    if img1 is not None:
+        assert (
+            img0.shape == img1.shape
+        ), "Source and target image must have the same shape!"
+
+    if mean_0 is None:
+        mean_0 = compute_kernel_mean_2d(img0, kernel)
+
+    if img1 is not None and mean_1 is None:
+        mean_1 = compute_kernel_mean_2d(img1, kernel)
+
+    # No need to compute target mean when targe image is None
+    mean_1 = None if img1 is None else mean_1
+
+    if mean_1 is not None:
+        assert mean_0.shape == mean_1.shape, "Mean tensors must have the same shape!"
+
+    covar = (
+        compute_kernel_mean_2d(img0 * img1 if img1 is not None else img0**2, kernel)
+    ) - (mean_0 * mean_1 if mean_1 is not None else mean_0**2)
+    return covar
+
+
 class GroupSSIMLoss(_Loss):
     def __init__(
         self,
@@ -101,55 +146,6 @@ class GroupSSIMLoss(_Loss):
             + f"size={self._kernel_size}, mean={self._kernel_size // 2}, variance={self._sigma:.6f}."
         )
 
-    @staticmethod
-    def compute_mean(img: torch.FloatTensor, kernel: torch.FloatTensor):
-        """Compute mean of an image."""
-        c = img.shape[1]
-
-        mean = torch.conv2d(
-            img,
-            torch.tile(kernel, (c, 1, 1, 1)),
-            stride=1,
-            padding="same",
-            groups=c,
-        )
-        return mean
-
-    @staticmethod
-    def compute_covariance(
-        img0: torch.FloatTensor,
-        mean_0: Optional[torch.FloatTensor] = None,
-        img1: Optional[torch.FloatTensor] = None,
-        mean_1: Optional[torch.FloatTensor] = None,
-        kernel: Optional[torch.FloatTensor] = None,
-    ):
-        """Compute covariance between two images."""
-        if img1 is not None:
-            assert (
-                img0.shape == img1.shape
-            ), "Source and target image must have the same shape!"
-
-        if mean_0 is None:
-            mean_0 = GroupSSIMLoss.compute_mean(img0, kernel)
-
-        if img1 is not None and mean_1 is None:
-            mean_1 = GroupSSIMLoss.compute_mean(img1, kernel)
-
-        # No need to compute target mean when targe image is None
-        mean_1 = None if img1 is None else mean_1
-
-        if mean_1 is not None:
-            assert (
-                mean_0.shape == mean_1.shape
-            ), "Mean tensors must have the same shape!"
-
-        covar = (
-            GroupSSIMLoss.compute_mean(
-                img0 * img1 if img1 is not None else img0**2, kernel
-            )
-        ) - (mean_0 * mean_1 if mean_1 is not None else mean_0**2)
-        return covar
-
     def forward(
         self, input: torch.FloatTensor, target: torch.FloatTensor
     ) -> torch.FloatTensor:
@@ -159,12 +155,12 @@ class GroupSSIMLoss(_Loss):
             input.shape == target.shape
         ), "source and target image must have the same shape!"
 
-        src_mean = self.compute_mean(input, kernel=self._kernel)
-        dst_mean = self.compute_mean(target, kernel=self._kernel)
+        src_mean = compute_kernel_mean_2d(input, kernel=self._kernel)
+        dst_mean = compute_kernel_mean_2d(target, kernel=self._kernel)
 
-        src_var = self.compute_covariance(input, src_mean, kernel=self._kernel)
-        dst_var = self.compute_covariance(target, dst_mean, kernel=self._kernel)
-        src_dst_covar = self.compute_covariance(
+        src_var = compute_kernel_covariance_2d(input, src_mean, kernel=self._kernel)
+        dst_var = compute_kernel_covariance_2d(target, dst_mean, kernel=self._kernel)
+        src_dst_covar = compute_kernel_covariance_2d(
             input, src_mean, target, dst_mean, kernel=self._kernel
         )
 
@@ -390,24 +386,24 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         device = rd_imgs.device
 
-        group_ssim = GroupSSIMLoss(
-            kernel_size=kernel_size,
-            sigma=sigma,
-            c1=c1,
-            c2=c2,
-            padding=padding,
-            filter=filter,
-        ).to(device)
+        if filter is None:
+            xs = torch.arange(kernel_size, dtype=torch.float32, device=device)
+            mu = int(kernel_size // 2)
+            sigma = float(sigma)
+            filter = (
+                1.0
+                / (torch.sqrt(2 * torch.pi * sigma**2))
+                * torch.exp(-((xs - mu) ** 2) / (2 * sigma**2))
+            )
+        kernel = torch.outer(filter, filter)[None, None, ...]
+        kernel = kernel.detach()
+        half_ksize = kernel_size // 2
 
-        kernel = group_ssim._kernel.clone().detach()
-        ksize = group_ssim._kernel_size
-        half_ksize = ksize // 2
-
-        rd_means = group_ssim.compute_mean(rd_imgs, kernel=kernel)
-        gt_means = group_ssim.compute_mean(gt_imgs, kernel=kernel)
-        rd_vars = group_ssim.compute_covariance(rd_imgs, rd_means, kernel=kernel)
-        gt_vars = group_ssim.compute_covariance(gt_imgs, gt_means, kernel=kernel)
-        rd_gt_covars = group_ssim.compute_covariance(
+        rd_means = compute_kernel_mean_2d(rd_imgs, kernel=kernel)
+        gt_means = compute_kernel_mean_2d(gt_imgs, kernel=kernel)
+        rd_vars = compute_kernel_covariance_2d(rd_imgs, rd_means, kernel=kernel)
+        gt_vars = compute_kernel_covariance_2d(gt_imgs, gt_means, kernel=kernel)
+        rd_gt_covars = compute_kernel_covariance_2d(
             rd_imgs, rd_means, gt_imgs, gt_means, kernel=kernel
         )
 
@@ -434,20 +430,20 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         f3 = (c2 + rd_vars + gt_vars) * mask
 
         # g0 = lambda x: 2.0 * W ⊗ (μ'(a, b, R) * x)
-        g0 = lambda x: 2.0 * group_ssim.compute_mean(gt_means * x, kernel=kernel)
+        g0 = lambda x: 2.0 * compute_kernel_mean_2d(gt_means * x, kernel=kernel)
 
         # g1 = lambda x: 2.0 * R'(m, n) * W ⊗ x - 2.0 * W ⊗ (μ'(a, b, R) * x)
-        g1 = lambda x: 2.0 * gt_imgs * group_ssim.compute_mean(
+        g1 = lambda x: 2.0 * gt_imgs * compute_kernel_mean_2d(
             x, kernel=kernel
-        ) - 2.0 * group_ssim.compute_mean(gt_means * x, kernel=kernel)
+        ) - 2.0 * compute_kernel_mean_2d(gt_means * x, kernel=kernel)
 
         # g2 = lambda x: 2.0 * W ⊗ (μ(a, b, R) * x)
-        g2 = lambda x: 2.0 * group_ssim.compute_mean(rd_means * x, kernel=kernel)
+        g2 = lambda x: 2.0 * compute_kernel_mean_2d(rd_means * x, kernel=kernel)
 
         # g3 = lambda x: 2.0 * R(m, n) * W ⊗ x - 2.0 * W ⊗ (μ(a, b, R) * x)
-        g3 = lambda x: 2.0 * rd_imgs * group_ssim.compute_mean(
+        g3 = lambda x: 2.0 * rd_imgs * compute_kernel_mean_2d(
             x, kernel=kernel
-        ) - 2.0 * group_ssim.compute_mean(rd_means * x, kernel=kernel)
+        ) - 2.0 * compute_kernel_mean_2d(rd_means * x, kernel=kernel)
 
         # To avoid duplicated computation
         f0f1 = f0 * f1
@@ -460,8 +456,8 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
 
         hess = None
         if with_hessian:
-            h2 = lambda x: 2.0 * group_ssim.compute_mean(x, kernel=kernel**2)
-            h3 = lambda x: 2.0 * group_ssim.compute_mean(
+            h2 = lambda x: 2.0 * compute_kernel_mean_2d(x, kernel=kernel**2)
+            h3 = lambda x: 2.0 * compute_kernel_mean_2d(
                 x, kernel=kernel * (1.0 - kernel)
             )
 
