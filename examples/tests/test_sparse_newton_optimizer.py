@@ -15,7 +15,7 @@ from collections import namedtuple
 from typing import OrderedDict, Optional
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
-from gsplat.rendering import rasterization, rasterize_to_pixels
+from gsplat.rendering import rasterization, rasterize_to_pixels, spherical_harmonics
 from gsplat.logger import create_logger
 from gsplat.optimizers.sparse_newton import (
     GroupSSIMLoss,
@@ -269,7 +269,7 @@ def test_fused_ssim_backward():
 
     gt_imgs = data.groundtruth_image.contiguous()
     rd_imgs = data.render_image.contiguous()
-    
+
     device = gt_imgs.device
 
     ssim_loss_func = lambda rd_imgs: fused_ssim(rd_imgs, gt_imgs, padding="valid")
@@ -565,7 +565,86 @@ def test_backward_render_to_sh_color_tile():
     assert torch.allclose(tile_jacob, torch_jacob)
 
 
+def test_backward_sh_color_to_position():
+    """Test backward pass of Spherical Harmonics w.r.t view directions."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    n_views = np.random.randint(5, 10)
+    n_splats = np.random.randint(100, 300)
+    n_channels = 3
+
+    sh_deg = 3
+
+    sh_coeffs = torch.rand(
+        size=[n_splats, (sh_deg + 1) ** 2, n_channels],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    view_mats = (
+        torch.randn(
+            size=[n_views, 4, 4],
+            device=device,
+            dtype=torch.float32,
+        )
+        * 100.0
+        + 33.0
+    )
+    means3d = (
+        torch.randn(
+            size=[n_splats, 3],
+            device=device,
+            dtype=torch.float32,
+        )
+        * 10.0
+        + 3.0
+    )
+
+    start = time.time()
+    sh_deriv_funcs = GSGroupNewtonOptimizer._cache_sh_derivative_functions(
+        sh_deg=sh_deg
+    )
+    end = time.time()
+    sh_deriv_elapsed = float(end - start)
+    LOGGER.info(
+        f"SH Degree={sh_deg}, Cache SH Derivatives={sh_deriv_elapsed:.6f} seconds."
+    )
+
+    start = time.time()
+    ours_jacob, _ = GSGroupNewtonOptimizer._backward_sh_color_to_position(
+        view_mats,
+        means3d,
+        sh_coeffs,
+        sh_deriv_funcs=sh_deriv_funcs,
+        with_hessian=True,
+    )
+    end = time.time()
+    ours_jacob_elapsed = float(end - start)
+    LOGGER.info(
+        f"#Views={n_views}, Splats={n_splats}, OursJacobian={ours_jacob_elapsed:.6f} seconds."
+    )
+
+    forward_func = lambda positions: spherical_harmonics(
+        degrees_to_use=sh_deg,
+        dirs=positions[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :],
+        coeffs=sh_coeffs[None].repeat([n_views, 1, 1, 1]),
+    )
+    torch_jacob = torch.autograd.functional.jacobian(
+        forward_func,
+        means3d,
+        vectorize=False,
+        create_graph=True,
+    )
+    torch_jacob = torch_jacob.permute([0, 1, 3, 2, 4])
+    splat_idxs = list(range(n_splats))
+    torch_jacob = torch_jacob[:, splat_idxs, splat_idxs, :, :]
+    assert torch.allclose(
+        ours_jacob, torch_jacob, atol=1e-3, rtol=1e-2
+    ), f"{__name__}: Jacobian mismatch!"
+
+
 if __name__ == "__main__":
+    test_backward_sh_color_to_position()
     test_backward_render_to_sh_color_tile()
     test_fused_ssim_backward()
     test_render_color_forward()

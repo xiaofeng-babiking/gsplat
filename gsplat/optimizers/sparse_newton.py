@@ -4,7 +4,8 @@ from scipy.optimize import curve_fit
 from torch.nn.modules.loss import _Loss
 from enum import Enum
 from collections.abc import Iterable
-from typing import Dict, Any, Optional, Literal, Tuple
+from typing import Dict, Any, Optional, Literal, Tuple, List, Callable
+from sympy import symbols, simplify, diff, lambdify
 from gsplat.rendering import spherical_harmonics
 
 
@@ -651,11 +652,6 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         return sh_colors_cache
 
     @staticmethod
-    def _backward_render_to_position_tile():
-        """Backward pass of rendered pixels w.r.t splats' positions."""
-        raise NotImplementedError
-
-    @staticmethod
     def _backward_render_to_sh_color_tile(
         n_channels: int,
         tile_alphas: int,
@@ -700,3 +696,213 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             else None
         )
         return tile_jacob, tile_hess
+
+    @staticmethod
+    def _cache_sh_derivative_functions(sh_deg: int):
+        """Cache derivative functions of spherical harmonics."""
+        assert sh_deg <= 3, "Only support Spherical Harmonics rotation degree <= 3."
+
+        x, y, z = symbols("x y z")
+
+        r = (x**2 + y**2 + z**2) ** (1 / 2)
+
+        # Reference:
+        #   [1] https://en.wikipedia.org/wiki/Table_of_spherical_harmonics#Real_spherical_harmonics
+        sh_exprs = [
+            1.0,  # Y(0, 0)
+            y / r,  # Y(1, -1)
+            z / r,  # Y(1, 0)
+            x / r,  # Y(1, 1)
+            x * y / r**2,  # Y(2, -2)
+            y * z / r**2,  # Y(2, -1)
+            (3 * z**2 - r**2) / r**2,  # Y(2, 0)
+            x * z / r**2,  # Y(2, 1)
+            (x**2 - y**2) / r**2,  # Y(2, 2)
+            y * (3 * x**2 - y**2) / r**3,  # Y(3, -3)
+            x * y * z / r**3,  # Y(3, -2)
+            y * (5 * z**2 - r**2) / r**3,  # Y(3, -1)
+            (5 * z**3 - 3 * z * r**2) / r**3,  # Y(3, 0)
+            x * (5 * z**2 - r**2) / r**3,  # Y(3, 1)
+            (x**2 - y**2) * z / r**3,  # Y(3, 2)
+            x * (x**2 - 3 * y**2) / r**3,  # Y(3, 3)
+        ]
+
+        sh_deriv_funcs = []
+        for i in range((sh_deg + 1) ** 2):
+            sh_expr = sh_exprs[i]
+
+            sh_deriv_dict = {"index": i}
+
+            # 1st order derivatives
+            for u in [x, y, z]:
+                du_expr = simplify(diff(sh_expr, u))
+                sh_deriv_dict[f"d{u}"] = lambdify(
+                    [x, y, z],
+                    du_expr,
+                    modules=["torch"],
+                )
+
+            # 2nd order derivatives
+            for u, v in [(x, x), (x, y), (x, z), (y, y), (y, z), (z, z)]:
+                dudv_expr = simplify(diff(sh_expr, u, v))
+                sh_deriv_dict[f"d{u}d{v}"] = lambdify(
+                    [x, y, z],
+                    dudv_expr,
+                    modules=["torch"],
+                )
+
+            sh_deriv_funcs.append(sh_deriv_dict)
+        return sh_deriv_funcs
+
+    @staticmethod
+    def _backward_sh_color_to_position(
+        view_mats: torch.FloatTensor,
+        means3d: torch.FloatTensor,
+        sh_coeffs: torch.FloatTensor,
+        sh_consts: Optional[torch.FloatTensor] = None,
+        masks: Optional[torch.BoolTensor] = None,
+        sh_deriv_funcs: Optional[List[Dict[str, Callable]]] = None,
+        with_hessian: bool = False,
+    ):
+        """Backward pass of spherical harmonics colors w.r.t splats' positions.
+
+        Args:
+            [1] view_mats: View matrices, Dim=[mN, 4, 4], torch.FloatTensor.
+            [2] means3d: Splat center positions, Dim=[mK, 3], torch.FloatTensor.
+            [3] sh_coeffs: Spherical harmonics coefficients, Dim=[mK, (L + 1)^2, 3], torch.FloatTensor.
+            [4] sh_consts: Spherical harmonics constants for each rotation order, Dim=[(L + 1)^2], torch.FloatTensor.
+            [5] masks: Mask for valid splats, Dim=[mN, mK], torch.BoolTensor.
+            [6] with_hessian: Whether to compute the Hessian matrix, bool.
+
+        Return:
+            [1] jacob: Jacobian matrix, Dim=[mN, mK, 3], torch.FloatTensor.
+            [2] hess: Hessian matrix, Dim=[mN, mK, mK, 3], torch.FloatTensor.
+        """
+        SPHERICAL_HARMONICS_CONSTANTS = [
+            +0.2820947917738781,  # Y(0, 0), 1.0 / 2.0 * sqrt(1.0 / pi)
+            -0.4886025119029199,  # Y(1, -1), sqrt(3.0 / (4.0 * pi))
+            +0.4886025119029199,  # Y(1, 0), sqrt(3.0 / (4.0 * pi))
+            -0.4886025119029199,  # Y(1, 1), sqrt(3.0 / (4.0 * pi))
+            +1.0925484305920792,  # Y(2, -2), 1.0 * / 2.0 * sqrt(15.0 / pi)
+            -1.0925484305920792,  # Y(2, -1), 1.0 * / 2.0 * sqrt(15.0 / pi)
+            +0.3153915652525201,  # Y(2, 0), 1.0 * / 4.0 * sqrt(5.0 / pi)
+            -1.0925484305920792,  # Y(2, 1), 1.0 * / 2.0 * sqrt(15.0 / pi)
+            +0.5462742152960395,  # Y(2, 2), 1.0 * / 4.0 * sqrt(15.0 / pi)
+            -0.5900435899266435,  # Y(3, -3), 1.0 * / 4.0 * sqrt(35.0 / (2.0 * pi))
+            +2.8906114426405540,  # Y(3, -2), 1.0 * / 2.0 * sqrt(105.0 / pi)
+            -0.4570457994644658,  # Y(3, -1), 1.0 * / 4.0 * sqrt(21.0 / (2.0 * pi))
+            +0.3731763325901154,  # Y(3, 0), 1.0 * / 4.0 * sqrt(7.0 / pi)
+            -0.4570457994644658,  # Y(3, 1), 1.0 * / 4.0 * sqrt(21.0 / (2.0 * pi))
+            +1.4453057213202770,  # Y(3, 2), 1.0 * / 4.0 * sqrt(105.0 / pi)
+            -0.5900435899266435,  # Y(3, 3), 1.0 * / 4.0 * sqrt(35.0 / (2.0 * pi))
+        ]
+
+        if sh_consts is None:
+            sh_consts = torch.tensor(SPHERICAL_HARMONICS_CONSTANTS).to(sh_coeffs.device)
+            sh_consts = sh_consts[: sh_coeffs.shape[-2]]
+
+        sh_deg = int(np.sqrt(sh_coeffs.shape[-2])) - 1
+        # TODO: Support higher SH rotation degree >= 10
+        assert sh_deg <= 3, "Only support Spherical Harmonics rotation degree <= 3."
+
+        # camera positions in world space
+        cam_centers = torch.linalg.inv(view_mats)[:, :3, 3]
+
+        view_dirs = means3d[None, :, :] - cam_centers[:, None, :]  # Dim = [mN, mK, 3]
+
+        # REFERENCE:
+        #   [1] https://en.wikipedia.org/wiki/Table_of_spherical_harmonics#Real_spherical_harmonics
+
+        # SH-RGB = SUM_l_{0}^{L}(SUM_m_{-l}^{l}(C(l, m) * Y(x, y, z, l, m)))
+        #   where,
+        #       1. l - rotation degree 0 <= l <= L
+        #       2. m - rotation order -l <= m <= l
+        #       3. (x, y, z) - unit vector from camera center to splat position
+        #               * (x, y, z) = means3d - cam_center
+        #       4. C(l, m) - spherical harmonics coefficient
+        #       5. Y(x, y, z, l, m) - spherical harmonics function
+
+        # ∂(SH-RGB) / ∂(means3d) =
+        #    (∂(SH-RGB) / ∂(Y))
+        #       @ (∂(Y) / ∂((x, y, z)))
+        #           @ (∂((x, y, z)) / ∂(means3d))
+
+        n_views = view_mats.shape[0]
+        n_splats = means3d.shape[0]
+
+        # SH-RGB            Dim = [mN, mK, mC]
+        # SH-value          Dim = [mN, mK, (L + 1)^2]
+        # SH-coefficients   Dim = [1,  mK, (L + 1)^2, mC]
+        # RGB-to-V-jacobian Dim = [mN, mK, mC, (L + 1)^2]
+        rgb_to_v_jacob = sh_coeffs.permute([0, 2, 1])
+        rgb_to_v_jacob = rgb_to_v_jacob[None].repeat([n_views, 1, 1, 1])
+
+        # SH-Value          Dim = [mN, mK, (L + 1)^2]
+        # Directions        Dim = [mN, mK, 3]
+        # V-to-Dir-jacobian Dim = [mN, mK, (L + 1)^2, 3]
+        x = view_dirs[:, :, 0]
+        y = view_dirs[:, :, 1]
+        z = view_dirs[:, :, 2]
+
+        v_to_dir_jacob = torch.zeros(
+            size=[n_views, n_splats, (sh_deg + 1) ** 2, 3],
+            dtype=means3d.dtype,
+            device=means3d.device,
+        )
+        for i in range((sh_deg + 1) ** 2):
+            sh_deriv_dict = sh_deriv_funcs[i]
+            assert sh_deriv_dict["index"] == i
+
+            v_to_dir_jacob[:, :, i, 0] = sh_deriv_dict["dx"](x, y, z)
+            v_to_dir_jacob[:, :, i, 1] = sh_deriv_dict["dy"](x, y, z)
+            v_to_dir_jacob[:, :, i, 2] = sh_deriv_dict["dz"](x, y, z)
+        v_to_dir_jacob = v_to_dir_jacob * sh_consts[None, None, :, None]
+        jacob = torch.einsum("ijkl,ijlm->ijkm", rgb_to_v_jacob, v_to_dir_jacob)
+
+        hess = None
+        if with_hessian:
+            # ∂²(SH-RGB) / ∂(means3d)² =
+            #    (∂(SH-RGB) / ∂(Y)) @ ∂²(Y) / ∂(x, y, z)²
+
+            v_to_dir_hess = torch.zeros(
+                [n_views, n_splats, (sh_deg + 1) ** 2, 3, 3],
+                dtype=means3d.dtype,
+                device=means3d.device,
+            )
+
+            for i in range((sh_deg + 1) ** 2):
+                sh_deriv_dict = sh_deriv_funcs[i]
+                assert sh_deriv_dict["index"] == i
+
+                dxdx = sh_deriv_dict["dxdx"](x, y, z)
+                dxdy = sh_deriv_dict["dxdy"](x, y, z)
+                dxdz = sh_deriv_dict["dxdz"](x, y, z)
+                dydy = sh_deriv_dict["dydy"](x, y, z)
+                dydz = sh_deriv_dict["dydz"](x, y, z)
+                dzdz = sh_deriv_dict["dzdz"](x, y, z)
+
+                v_to_dir_hess[:, :, i, 0, 0] = dxdx
+                v_to_dir_hess[:, :, i, 0, 1] = dxdy
+                v_to_dir_hess[:, :, i, 0, 2] = dxdz
+                v_to_dir_hess[:, :, i, 1, 0] = dxdy
+                v_to_dir_hess[:, :, i, 1, 1] = dydy
+                v_to_dir_hess[:, :, i, 1, 2] = dydz
+                v_to_dir_hess[:, :, i, 2, 0] = dxdz
+                v_to_dir_hess[:, :, i, 2, 1] = dydz
+                v_to_dir_hess[:, :, i, 2, 2] = dzdz
+
+            # V-to-Dir-hessian Dim = [mN, mK, 1, (L + 1)^2, 3, 3]
+            v_to_dir_hess = v_to_dir_hess * sh_consts[None, None, :, None, None]
+
+            # RGB-to-V-jacobian Dim = [mN, mK, mC, (L + 1)^2, 1, 1]
+            # V-to-Dir-hessian Dim = [mN, mK, 1, (L + 1)^2, 3, 3]
+            hess = torch.sum(
+                rgb_to_v_jacob[:, :, :, :, None, None]
+                * v_to_dir_hess[:, :, None, :, :, :],
+                dim=3,
+            )
+
+        if masks is not None:
+            jacob = jacob * masks[:, :, None, None]
+            hess = hess * masks[:, :, None, None, None]
+        return jacob, hess
