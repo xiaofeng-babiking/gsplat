@@ -998,3 +998,96 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
         if with_hessian:
             raise NotImplementedError
         return tile_jacob, tile_hess
+
+    @staticmethod
+    def _backward_gaussians2d_to_means2d_tile(
+        tile_x: int,
+        tile_y: int,
+        tile_size: int,
+        img_width: int,
+        img_height: int,
+        means2d: torch.FloatTensor,
+        conics2d: torch.FloatTensor,
+        tile_sigmas: torch.FloatTensor,
+        with_hessian: bool = False,
+    ):
+        """Backward from 2D Gaussian kernels to means2d.
+
+        Args:
+            [1] tile_x: tile column index, int.
+            [2] tile_y: tile row index, int.
+            [3] tile_size: tile width and height, int.
+            [4] img_width: image width, int.
+            [5] img_height: image height, int.
+            [6] means2d: Means of each Gaussian kernel, Dim = [tK, 2].
+            [7] conics2d: Conic matrices of each Gaussian kernel, Dim = [tK, 3].
+            [8] tile_sigmas: Sigmas of each Gaussian kernel, Dim = [tile_size, tile_size, tK].
+                    i.e. G(k, m, n) = exp(-tile_sigmas(m, n, k))
+            [9] with_hessian: Whether to compute the second derivative matrix. Default: False.
+
+        Returns:
+            [1] jacob: Jacobian matrix of Gaussian kernel parameters w.r.t. means2d.
+                    Dim = [tile_size, tile_size, tK, 2]
+            [2] hess: Hessian matrix of Gaussian kernel parameters w.r.t. means2d.
+                    Dim = [tile_size, tile_size, tK, 2, 2]
+
+        G(k, m, n) = exp(-0.5 * (x(m, n) - means2d(k)).T @ conics2d @ (x(m, n) - means2d(k)))
+
+        ∂(G(k, m, n)) / ∂(means2d(k))
+            = -G(k, m, n) * conics2d.T * (means2d(k) - x(m, n))
+        ∂²(G(k, m, n)) / ∂(means2d(k))²
+            = G(k, m, n)² * (conics2d.T * (means2d(k) - x(m, n))² - 0.5 * G(k, m, n) * conics2d
+        """
+        tile_xmin = tile_x * tile_size
+        tile_xmax = min((tile_x + 1) * tile_size, img_width)
+        tile_width = tile_xmax - tile_xmin
+
+        tile_ymin = tile_y * tile_size
+        tile_ymax = min((tile_y + 1) * tile_size, img_height)
+        tile_height = tile_ymax - tile_ymin
+
+        tile_sigmas = tile_sigmas[:tile_height, :tile_width, :]
+
+        tile_ys, tile_xs = torch.meshgrid(
+            torch.arange(
+                tile_ymin, tile_ymax, dtype=means2d.dtype, device=means2d.device
+            ),
+            torch.arange(
+                tile_xmin, tile_xmax, dtype=means2d.dtype, device=means2d.device
+            ),
+            indexing="ij",
+        )
+
+        tile_pixels = torch.stack([tile_xs, tile_ys], dim=-1) + 0.5
+        tile_pixels = means2d[None, None, :, :] - tile_pixels[:, :, None, :]
+        # Dim = [tile_size, tile_size, tK, 2]
+
+        gaussians2d = torch.exp(-tile_sigmas)
+
+        n_splats = means2d.shape[0]
+        tile_conics2d = torch.zeros(
+            size=[n_splats, 2, 2], dtype=conics2d.dtype, device=conics2d.device
+        )
+        tile_conics2d[:, 0, 0] = conics2d[:, 0]
+        tile_conics2d[:, 0, 1] = conics2d[:, 1]
+        tile_conics2d[:, 1, 0] = conics2d[:, 1]
+        tile_conics2d[:, 1, 1] = conics2d[:, 2]
+        # Dim = [tK, 2, 2]
+
+        tile_derivs = torch.einsum(
+            "klm,ijkmn->ijkln", tile_conics2d, tile_pixels[..., None]
+        ).squeeze(-1)
+        # Dim = [tile_size, tile_size, tK, 2]
+
+        tile_jacob = -gaussians2d[:, :, :, None] * tile_derivs
+
+        tile_hess = None
+        if with_hessian:
+            tile_hess = (gaussians2d[:, :, :, None, None] ** 2) * torch.einsum(
+                "ijklm,ijkmn->ijkln",
+                tile_derivs[:, :, :, :, None],
+                tile_derivs[:, :, :, None, :],
+            ) - 0.5 * gaussians2d[:, :, :, None, None] * tile_conics2d[
+                None, None, :, :, :
+            ]
+        return tile_jacob, tile_hess
