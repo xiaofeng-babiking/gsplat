@@ -906,3 +906,95 @@ class GSGroupNewtonOptimizer(torch.optim.Optimizer):
             jacob = jacob * masks[:, :, None, None]
             hess = hess * masks[:, :, None, None, None]
         return jacob, hess
+
+    @staticmethod
+    def _backward_render_to_gaussians2d_tile(
+        sh_colors: torch.FloatTensor,
+        opacities: torch.FloatTensor,
+        tile_alphas: torch.FloatTensor,
+        blend_alphas: torch.FloatTensor,
+        with_hessian: bool = False,
+    ):
+        """Backward rendered RGB pixels to 2D Gaussian kernels.
+
+        Args:
+            [1] sh_colors: Spherical harmonic colors of each pixel, Dim = [tK, 3].
+            [2] opacities: Opacity of each pixel, Dim = [tK].
+            [3] tile_alphas: Alphas of each pixel on the tile, Dim = [tile_size, tile_size, tK].
+            [4] blend_alphas: Blending alphas of each pixel on the tile, Dim = [tile_size, tile_size, tK].
+            [5] with_hessian: Whether to compute the second derivative matrix. Default: False.
+
+        Returns:
+            [1] jacob: Jacobian matrix of each pixel w.r.t. Gaussian kernel parameters, Dim = [tile_size, tile_size, 3, tK, 2].
+                    render: Dim=[tile_size, tile_size, 3]
+                    gaussian2d: Dim=[tile_size, tile_size, tK, 2]
+            [2] hess: Hessian matrix of each pixel w.r.t. Gaussian kernel parameters.
+
+        For pixel (m, n),
+
+        RGB = SUM_k^{tK}(α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)))
+            where, α(j) = G(j) * σ(j)
+
+        ∂(RGB) / ∂(G(0))
+            = ∂(RGB)/ ∂(α(0)) @ ∂(α(0)) / ∂(G(0))
+            = ∂(RGB)/ ∂(α(0)) * σ(0)
+            = σ(0) * (
+                + SH(0) * 1.0
+                - α(1) * SH(1) * CUMPROD_j^{0}(1.0 - α(j)) / (1 - α(0))
+                - α(2) * SH(2) * CUMPROD_j^{1}(1.0 - α(j)) / (1 - α(0))
+                ...
+                - α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)) / (1 - α(0))
+            )
+
+        ∂(RGB) / ∂(G(1))
+            = σ(1) * (
+                + SH(1) * CUMPROD_j^{0}(1.0 - α(j))
+                - α(2) * SH(2) * CUMPROD_j^{0}(1.0 - α(j)) / (1 - α(1))
+                - α(3) * SH(3) * CUMPROD_j^{1}(1.0 - α(j)) / (1 - α(1))
+                ...
+                - α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)) / (1 - α(1))
+            )
+
+
+        ...
+
+        Let β(k) = α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)),
+        Then,
+            S = [σ(0), σ(1), ..., σ(k)].T
+            B = [β(0), β(1), ..., β(k)].T
+            W = [
+                    [1.0 / ..., -1.0 / (1.0 - α(0)),    ...     ,                       -1.0 / (1.0 - α(0))],
+                    [0.0,            1.0 / ...    , -1.0 / (1.0 - α(1)),      ... ,     -1.0 / (1.0 - α(1))],
+                    ...
+                    [0.0,     0.0    ,    ...     ,                      1.0 / ..., -1.0 / (1.0 - α(k - 1))],
+                    [0.0,     0.0    ,    ...     ,                         0.0,                  1.0 / ...],
+            ]
+            ∂(RGB) / ∂(G(k)) = W @ B
+        """
+        tile_betas = (
+            tile_alphas[:, :, :, None]
+            * sh_colors[None, None, :, :]
+            * blend_alphas[:, :, :, None]
+        )  # Dim = [tile_size, tile_size, tK, 3]
+
+        tile_size = tile_alphas.shape[0]
+        n_splats = len(opacities)
+
+        jacob_weights = torch.zeros(
+            size=[tile_size, tile_size, n_splats, n_splats],
+            dtype=tile_betas.dtype,
+            device=tile_betas.device,
+        )  # Dim = [tile_size, tile_size, tK, tK]
+        jacob_weights = torch.triu(jacob_weights, diagonal=0)
+        jacob_weights = -jacob_weights / (1.0 - tile_alphas[:, :, :, None])
+
+        splat_idxs = list(range(n_splats))
+        jacob_weights[:, :, splat_idxs, splat_idxs] = 1.0 / (tile_alphas + 1e-12)
+
+        tile_jacob = torch.einsum("ijkl,ijlm->ijkm", jacob_weights, tile_betas)
+        tile_jacob = tile_jacob * opacities[None, None, :, None]
+        tile_jacob = tile_jacob.permute([0, 1, 3, 2])
+        tile_hess = None
+        if with_hessian:
+            raise NotImplementedError
+        return tile_jacob, tile_hess

@@ -640,10 +640,81 @@ def test_backward_sh_color_to_position():
     torch_jacob = torch_jacob[:, splat_idxs, splat_idxs, :, :]
     assert torch.allclose(
         ours_jacob, torch_jacob, atol=1e-3, rtol=1e-2
-    ), f"{__name__}: Jacobian mismatch!"
+    ), f"{test_backward_sh_color_to_position.__name__}: Jacobian mismatch!"
+
+
+def test_backward_render_to_gaussians2d_tile():
+    """Test backward pass of rendering a tile w.r.t the splats gausssians2d."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    tile_size = 16
+    n_splats = np.random.randint(900, 1200)
+    n_channels = 3
+
+    tile_gassians2d = torch.rand(
+        size=[tile_size, tile_size, n_splats],
+        device=device,
+        dtype=torch.float32,
+    )
+    opacities = torch.rand(size=[n_splats], device=device, dtype=torch.float32)
+
+    tile_alphas = tile_gassians2d * opacities
+    tile_alphas = torch.clamp_max(tile_alphas, 0.9999)
+
+    blend_alphas = 1.0 - tile_alphas
+    blend_alphas = torch.cumprod(1.0 - tile_alphas, dim=-1)
+    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
+    blend_alphas[:, :, 0] = 1.0
+
+    sh_colors = torch.rand(
+        size=[n_splats, n_channels],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    alpha_blend_func = lambda gaussians2d: torch.sum(
+        torch.clamp_max(gaussians2d * opacities, 0.9999)[
+            :, :, :, None
+        ]  # [tile_size, tile_size, tK, 1]
+        * blend_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+        * sh_colors[None, None, :, :],  # [1, 1, tK, 3]
+        dim=-2,
+    )
+    torch_jacob = torch.autograd.functional.jacobian(
+        alpha_blend_func,
+        tile_gassians2d,
+        vectorize=False,
+        create_graph=True,
+    )
+    torch_jacob = torch_jacob.permute([0, 1, 3, 4, 2, 5])
+    ys, xs = torch.meshgrid(
+        torch.arange(start=0, end=tile_size, device=device, dtype=torch.long),
+        torch.arange(start=0, end=tile_size, device=device, dtype=torch.long),
+        indexing="ij",
+    )
+    torch_jacob = torch_jacob[ys, xs, ys, xs, :, :]
+
+    start = time.time()
+    ours_jacob, _ = GSGroupNewtonOptimizer._backward_render_to_gaussians2d_tile(
+        sh_colors,
+        opacities,
+        tile_alphas,
+        blend_alphas,
+        with_hessian=False,
+    )
+    end = time.time()
+    ours_jacob_elapsed = float(end - start)
+    LOGGER.info(
+        f"TileSize={tile_size}, #Splats={n_splats}, OursJacobian={ours_jacob_elapsed:.6f}"
+    )
+
+    assert torch.allclose(
+        torch_jacob, ours_jacob, atol=1e-3, rtol=1e-2
+    ), f"{test_backward_render_to_gaussians2d_tile.__name__}: Jacobian mismatch!"
 
 
 if __name__ == "__main__":
+    test_backward_render_to_gaussians2d_tile()
     test_backward_sh_color_to_position()
     test_backward_render_to_sh_color_tile()
     test_fused_ssim_backward()
