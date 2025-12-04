@@ -24,15 +24,15 @@ def project_means_3d_to_2d(
     # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
     cam_means3d = (
         torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
-        + view_mat[:, :3, 3][:, None, :]
+        + view_mats[:, :3, 3][:, None, :]
     )
 
     # Dim = [mN, 1, 3, 3] * [mN, tK, 1, 3] -> [mN, tK, 3]
-    means2d = torch.sum(cam_mats[:, None, :, :] * cam_means3d[:, :, None, :])
+    means2d = torch.sum(cam_mats[:, None, :, :] * cam_means3d[:, :, None, :], dim=-1)
 
     # Dim = [mN, tK, 2]
-    means2d = means2d[:, :, :2] / (means2d[:, :, 2][..., None])
-    return means3d
+    means2d = means2d[:, :, :2] / means2d[:, :, 2][..., None]
+    return means2d
 
 
 def get_tile_size(
