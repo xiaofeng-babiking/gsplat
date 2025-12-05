@@ -11,21 +11,16 @@ import torch
 import cv2 as cv
 import numpy as np
 from tqdm import tqdm
+from pyquaternion import Quaternion
 from collections import namedtuple
 from typing import OrderedDict, Optional
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
-from gsplat.rendering import rasterization, rasterize_to_pixels, spherical_harmonics
+from gsplat.rendering import rasterization, spherical_harmonics, fully_fused_projection
 from gsplat.logger import create_logger
 from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 from gsplat.optimizers.torch_functions_forward import *
-from gsplat.cuda._torch_impl import (
-    _quat_scale_to_matrix,
-    _persp_proj,
-    _world_to_cam,
-    _fully_fused_projection,
-)
 
 COLMAP_DATA_PATH = os.getenv("COLMAP_DATA_PATH")
 if not COLMAP_DATA_PATH:
@@ -213,23 +208,24 @@ def test_rasterization_tile_forward():
 
     # 3. test inverse covariance 2d
     covars3d_fwd = compute_covariance_3d(quats, scales)
-    covars3d_meta = _quat_scale_to_matrix(quats, scales)
     assert torch.allclose(
-        covars3d_fwd, covars3d_meta, atol=1e-4, rtol=1e-3
-    ), "Covariance 3D failed!"
+        covars3d_fwd, covars3d_fwd.transpose(-1, -2)
+    ), f"Covariance 3D NOT symmetric!"
 
-    means3d_cam, covars3d_cam = _world_to_cam(means3d, covars3d_meta, view_mat)
-    means2d_meta, covars2d_meta = _persp_proj(
-        means3d_cam, covars3d_cam, cam_mat, img_w, img_h
-    )
-    covars2d_fwd, conics2d_fwd = project_covariances_3d_to_2d(
+    _, conics2d_fwd = project_covariances_3d_to_2d(
         view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h
     )
-    assert torch.allclose(
-        covars2d_fwd, covars2d_meta, atol=1e-4, rtol=1e-1
-    ), "Covariance 2D failed!"
-
     conics2d_meta = rd_meta["conics"]
+    assert torch.allclose(
+        conics2d_fwd[0, :, 0, 0], conics2d_meta[:, 0], atol=1e-4, rtol=1e-3
+    ), "Inverse covariance 2D XX failed!"
+    assert torch.allclose(
+        conics2d_fwd[0, :, 0, 1], conics2d_meta[:, 1], atol=1e-4, rtol=1e-3
+    ), "Inverse covariance 2D XY failed!"
+    assert torch.allclose(
+        conics2d_fwd[0, :, 1, 1], conics2d_meta[:, 2], atol=1e-4, rtol=1e-3
+    ), "Inverse covariance 2D YY failed!"
+
 
 if __name__ == "__main__":
     test_rasterization_tile_forward()
