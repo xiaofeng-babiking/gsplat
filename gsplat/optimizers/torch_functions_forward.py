@@ -138,13 +138,15 @@ def compute_gaussian_weights_2d_tile(
 
 def compute_pinhole_jacobian(
     cam_mats: torch.FloatTensor,
-    means3d: torch.FloatTensor,
+    cam_means3d: torch.FloatTensor,
+    img_w: int,
+    img_h: int,
 ):
     """Compute pinhole projection jacobian.
 
     Args:
         [1] cam_mats: Dim = [mN, 3, 3]
-        [2] means3d: Dim = [tK, 3]
+        [2] cam_means3d: Dim = [mN, tK, 3]
 
     Returns:
         [1] pin_jacob: Dim = [mN, tK, 2, 3]
@@ -159,26 +161,37 @@ def compute_pinhole_jacobian(
     # Dim = [mN, 1]
     fx = cam_mats[:, 0, 0][..., None]
     fy = cam_mats[:, 1, 1][..., None]
-    # cx = cam_mats[:, 0, 2][..., None]
-    # cy = cam_mats[:, 1, 2][..., None]
+    cx = cam_mats[:, 0, 2][..., None]
+    cy = cam_mats[:, 1, 2][..., None]
 
-    # Dim = [1, tK]
-    x = means3d[:, 0][None, ...]
-    y = means3d[:, 1][None, ...]
-    z = means3d[:, 2][None, ...]
+    # Dim = [mN, tK]
+    tx = cam_means3d[:, :, 0]
+    ty = cam_means3d[:, :, 1]
+    tz = cam_means3d[:, :, 2]
+
+    # Dim = [mN, 1]
+    tan_fovx = 0.5 * img_w / fx
+    tan_fovy = 0.5 * img_h / fy
+
+    lim_x_pos = (img_w - cx) / fx + 0.3 * tan_fovx
+    lim_x_neg = cx / fx + 0.3 * tan_fovx
+    lim_y_pos = (img_h - cy) / fy + 0.3 * tan_fovy
+    lim_y_neg = cy / fy + 0.3 * tan_fovy
+    tx = tz * torch.clamp(tx / tz, min=-lim_x_neg, max=lim_x_pos)
+    ty = tz * torch.clamp(ty / tz, min=-lim_y_neg, max=lim_y_pos)
 
     # Dim = [mN, tK, 2, 3]
     pin_jacob = torch.zeros(
-        size=[cam_mats.shape[0], means3d.shape[0], 2, 3],
-        dtype=means3d.dtype,
-        device=means3d.device,
+        size=[cam_mats.shape[0], cam_means3d.shape[1], 2, 3],
+        dtype=cam_means3d.dtype,
+        device=cam_means3d.device,
     )
-    pin_jacob[:, :, 0, 0] = fx / (z + EPS)
+    pin_jacob[:, :, 0, 0] = fx / (tz + EPS)
     # pin_jacob[:, :, 0, 1] = 0.0
-    pin_jacob[:, :, 0, 2] = -fx * x / (z**2 + EPS)
+    pin_jacob[:, :, 0, 2] = -fx * tx / (tz**2 + EPS)
     # pin_jacob[:, :, 1, 0] = 0.0
-    pin_jacob[:, :, 1, 1] = fy / (z + EPS)
-    pin_jacob[:, :, 1, 2] = -fy * y / (z**2 + EPS)
+    pin_jacob[:, :, 1, 1] = fy / (tz + EPS)
+    pin_jacob[:, :, 1, 2] = -fy * ty / (tz**2 + EPS)
     return pin_jacob
 
 
@@ -187,6 +200,9 @@ def project_covariances_3d_to_2d(
     cam_mats: torch.FloatTensor,
     means3d: torch.FloatTensor,
     covars3d: torch.FloatTensor,
+    img_w: int,
+    img_h: int,
+    with_inverse: bool = True,
 ):
     """Project 3D covariance matrix to 2D inverse.
 
@@ -195,46 +211,58 @@ def project_covariances_3d_to_2d(
         [2] cam_mats: Dim = [mN, 3, 3]
         [3] means3d:  Dim = [tK, 3]
         [4] covars3d: Dim = [tK, 3, 3]
+        [5] img_w: int
+        [6] img_h: int
+        [7] with_inverse: bool
 
     Return:
-        [1] conics2d: Dim = [mN, tK, 2, 2]
+        [1] covars2d: Dim = [mN, tK, 2, 2]
+        [2] conics2d: Dim = [mN, tK, 2, 2]
 
         covars2d = J @ W @ covars3d @ W.T @ J.T
     """
+    # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
+    cam_means3d = (
+        torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
+        + view_mats[:, :3, 3][:, None, :]
+    )
+
     # Dim = [mN, 3, 3]
     rot_mats = view_mats[:, :3, :3]
+    # Dim = [mN, 3, 3] @ [tK, 3, 3] @ [mN, 3, 3].T -> [mN, tK, 3, 3]
+    cam_covars3d = torch.einsum(
+        "ijk,lkm,imn->iljn", rot_mats, covars3d, rot_mats.transpose(-1, -2)
+    )
 
     # Dim = [mN, tK, 2, 3]
-    pin_jacob = compute_pinhole_jacobian(cam_mats, means3d)
+    pin_jacob = compute_pinhole_jacobian(cam_mats, cam_means3d, img_w, img_h)
 
-    # Dim = [mN, tK, 2, 3] @ [tK, 3, 3] -> [mN, tK, 2, 3]
-    jw = torch.einsum("ijkl,ilm->ijkm", pin_jacob, rot_mats)
-
-    # Dim = [mN, tK, 2, 3] @ [tK, 3, 3] -> [mN, tK, 2, 3]
-    covars2d = torch.einsum("ijkl,jlm->ijkm", jw, covars3d)
-
-    # Dim = [mN, tK, 2, 3] @ [mN, tK, 3, 2] -> [mN, tK, 2, 2]
-    covars2d = torch.einsum("ijkl,ijlm->ijkm", covars2d, jw.permute([0, 1, 3, 2]))
+    # Dim = [mN, tK, 2, 3] @ [mN, tK, 3, 3] @ [mN, tK, 2, 3].T
+    covars2d = torch.einsum(
+        "ijkl,ijlm,ijmn->ijkn", pin_jacob, cam_covars3d, pin_jacob.transpose(-1, -2)
+    )
 
     # covars2d = [a, b, c, d]
     # inverse covars2d = 1.0 / (a * d - b * c) * [d, -b, -c, a]
-    conics2d = torch.zeros_like(covars2d)
+    conics2d = None
+    if with_inverse:
+        conics2d = torch.zeros_like(covars2d)
 
-    a = covars2d[:, :, 0, 0]
-    b = covars2d[:, :, 0, 1]
-    c = covars2d[:, :, 1, 0]
-    d = covars2d[:, :, 1, 1]
+        a = covars2d[:, :, 0, 0] + 0.3  # NOTE. for numerical stability
+        b = covars2d[:, :, 0, 1]
+        c = covars2d[:, :, 1, 0]
+        d = covars2d[:, :, 1, 1] + 0.3  # NOTE. for numerical stability
 
-    det = 1.0 / (a * d - b * c + EPS)
+        det = 1.0 / (a * d - b * c + EPS)
 
-    conics2d[:, :, 0, 0] = d
-    conics2d[:, :, 0, 1] = -b
-    conics2d[:, :, 1, 0] = -c
-    conics2d[:, :, 1, 1] = a
+        conics2d[:, :, 0, 0] = d
+        conics2d[:, :, 0, 1] = -b
+        conics2d[:, :, 1, 0] = -c
+        conics2d[:, :, 1, 1] = a
 
-    # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
-    conics2d = conics2d * det[:, :, None, None]
-    return conics2d
+        # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
+        conics2d = conics2d * det[:, :, None, None]
+    return covars2d, conics2d
 
 
 def combine_sh_colors_from_coefficients(
@@ -254,7 +282,7 @@ def combine_sh_colors_from_coefficients(
     """
     n_ords = sh_coeffs.shape[-2]
 
-    sh_deg = int(np.sqrt(n_ords)) - 1
+    sh_deg = int(math.sqrt(n_ords)) - 1
 
     assert sh_deg <= 3, "Only support rotation degree <= 3!"
 
@@ -278,7 +306,11 @@ def combine_sh_colors_from_coefficients(
     ]
 
     if sh_consts is None:
-        sh_consts = SPHERICAL_HARMONICS_CONSTANTS[:n_ords]
+        sh_consts = torch.tensor(
+            SPHERICAL_HARMONICS_CONSTANTS[:n_ords],
+            dtype=sh_coeffs.dtype,
+            device=sh_coeffs.device,
+        )
 
     x = view_dirs[..., 0]
     y = view_dirs[..., 1]
