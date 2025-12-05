@@ -11,14 +11,12 @@ import torch
 import cv2 as cv
 import numpy as np
 from tqdm import tqdm
-from pyquaternion import Quaternion
 from collections import namedtuple
-from typing import OrderedDict, Optional
+from typing import OrderedDict
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization, spherical_harmonics, fully_fused_projection
 from gsplat.logger import create_logger
-from fused_ssim import FusedSSIMMap, fused_ssim
 from torchmetrics import StructuralSimilarityIndexMeasure
 from gsplat.optimizers.torch_functions_forward import *
 
@@ -169,24 +167,34 @@ def test_rasterization_tile_forward():
     cam_mats = data.camera_matrix.contiguous()
     view_mats = data.view_matrix.contiguous()
 
-    cam_idx = 3  # random.choice(list(range(cam_mats.shape[0])))
+    view_idx = 3  # random.choice(list(range(cam_mats.shape[0])))
 
-    rd_img = rd_imgs[cam_idx, :, :, :][None]
-    cam_mat = cam_mats[cam_idx, :, :][None]
-    view_mat = view_mats[cam_idx, :, :][None]
-    rd_meta = rd_metas[cam_idx]
+    rd_img = rd_imgs[view_idx, :, :, :][None]
+    rd_img = rd_img.permute([0, 2, 3, 1])  # NCHW -> NHWC
+    cam_mat = cam_mats[view_idx, :, :][None]
+    view_mat = view_mats[view_idx, :, :][None]
+    rd_meta = rd_metas[view_idx]
     img_w = rd_meta["width"]
     img_h = rd_meta["height"]
+    tile_size = rd_meta["tile_size"]
+    tile_w = math.ceil(img_w / tile_size)
+    tile_h = math.ceil(img_h / tile_size)
+    isect_offsets = rd_meta["isect_offsets"]
+    assert isect_offsets.shape == (1, tile_h, tile_w)
+    flatten_ids = rd_meta["flatten_ids"]
 
     del rd_imgs, cam_mats, view_mats, rd_metas
     torch.cuda.empty_cache()
 
+    device = rd_img.device
+
     gauss_ids = rd_meta["gaussian_ids"]
-    LOGGER.info(f"Random select camera-{cam_idx}, #Splats={len(gauss_ids)}.")
+    LOGGER.info(f"Random select View-{view_idx}, #Splats={len(gauss_ids)}.")
 
     means3d = splats["means"][gauss_ids]
     scales = torch.exp(splats["scales"][gauss_ids])
     opacities = torch.sigmoid(splats["opacities"][gauss_ids])
+    assert torch.allclose(opacities, rd_meta["opacities"], rtol=1e-3, atol=1e-3)
     quats = splats["quats"][gauss_ids]
     sh_coeffs = torch.cat([splats["sh0"][gauss_ids], splats["shN"][gauss_ids]], dim=1)
 
@@ -215,14 +223,8 @@ def test_rasterization_tile_forward():
 
     conics2d_meta = rd_meta["conics"]
     assert torch.allclose(
-        conics2d_fwd[0, :, 0, 0], conics2d_meta[:, 0], atol=1e-4, rtol=1e-3
-    ), "Inverse covariance 2D XX failed!"
-    assert torch.allclose(
-        conics2d_fwd[0, :, 0, 1], conics2d_meta[:, 1], atol=1e-4, rtol=1e-3
-    ), "Inverse covariance 2D XY failed!"
-    assert torch.allclose(
-        conics2d_fwd[0, :, 1, 1], conics2d_meta[:, 2], atol=1e-4, rtol=1e-3
-    ), "Inverse covariance 2D YY failed!"
+        conics2d_fwd[0], conics2d_meta, atol=1e-4, rtol=1e-3
+    ), "Inverse covariance 2D failed!"
 
     depths_meta = rd_meta["depths"]
     assert torch.allclose(
@@ -234,6 +236,61 @@ def test_rasterization_tile_forward():
     valid_meta = (radii_meta > 0).all(dim=-1)
     ratio = (valid_meta == valid_fwd).sum() / valid_meta.numel()
     assert ratio > 0.999, f"Radius 2D projection failed!"
+
+    # 3. test whole image rendering
+    ssimer = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    fwd_img = torch.zeros(size=[1, img_h, img_w, 3], dtype=torch.float32, device=device)
+    isect_offsets = isect_offsets[0].flatten()
+    for tile_x in range(tile_w):
+        for tile_y in range(tile_h):
+            start = time.time()
+            tile_idx = tile_y * tile_w + tile_x
+
+            isect_start = isect_offsets[tile_idx]
+            isect_end = (
+                isect_offsets[tile_idx + 1]
+                if tile_idx < tile_h * tile_w - 1
+                else len(flatten_ids)
+            )
+
+            if isect_start >= isect_end:
+                continue
+
+            flat_idxs = flatten_ids[isect_start:isect_end]
+
+            tile_rgb, tile_a, tile_bbox = rasterize_to_pixels_tile_forward(
+                tile_x,
+                tile_y,
+                tile_size,
+                img_w,
+                img_h,
+                means3d[flat_idxs],
+                quats[flat_idxs],
+                scales[flat_idxs],
+                opacities[flat_idxs],
+                sh_coeffs[flat_idxs],
+                cam_mat,
+                view_mat,
+            )
+            end = time.time()
+            tile_elapsed = float(end - start)
+
+            tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
+            tile_xmin, tile_ymin, crop_w, crop_h = tile_bbox
+
+            rd_rgb = rd_img[
+                :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w, :
+            ]
+
+            ssim = ssimer(rd_rgb.permute([0, 3, 1, 2]), tile_rgb.permute([0, 3, 1, 2]))
+            LOGGER.info(
+                f"Tile=({tile_x}, {tile_y}), Elapsed={tile_elapsed:.4f} seconds, SSIM={ssim:.4f}."
+            )
+
+            fwd_img[
+                :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w, :
+            ] = tile_rgb[:, :crop_h, :crop_w, :]
 
 
 if __name__ == "__main__":

@@ -36,14 +36,12 @@ def project_points_3d_to_2d(
     return cam_pnts3d, img_pnts2d
 
 
-def get_tile_size(
-    tile_x: int, tile_y: int, tile_w: int, tile_h: int, img_w: int, img_h: int
-):
+def get_tile_size(tile_x: int, tile_y: int, tile_size: int, img_w: int, img_h: int):
     """Get valid tile size within image."""
-    tile_xmin = tile_x * tile_w
-    tile_ymin = tile_y * tile_h
-    tile_xmax = min(img_w, tile_xmin + tile_w)
-    tile_ymax = min(img_h, tile_ymin + tile_h)
+    tile_xmin = tile_x * tile_size
+    tile_ymin = tile_y * tile_size
+    tile_xmax = min(img_w, tile_xmin + tile_size)
+    tile_ymax = min(img_h, tile_ymin + tile_size)
 
     crop_w = tile_xmax - tile_xmin
     crop_h = tile_ymax - tile_ymin
@@ -88,8 +86,7 @@ def compute_covariance_3d(
 def compute_gaussian_weights_2d_tile(
     tile_x: int,
     tile_y: int,
-    tile_w: int,
-    tile_h: int,
+    tile_size: int,
     img_w: int,
     img_h: int,
     means2d: torch.FloatTensor,
@@ -104,14 +101,14 @@ def compute_gaussian_weights_2d_tile(
         [4] tile_h: int.
         [5] img_w:  int.
         [6] img_h:  int.
-        [7] means2d: Dim=[tK, 2].
-        [8] conics2d: Dim=[tK, 2, 2].
+        [7] means2d: Dim=[mN, tK, 2].
+        [8] conics2d: Dim=[mN, tK, 2, 2].
 
     Returns:
-        [1] gauss_weights: Dim = [tH, tW, tK]
+        [1] gauss_weights: Dim = [mN, tH, tW, tK]
     """
     tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
-        tile_x, tile_y, tile_w, tile_h, img_w, img_h
+        tile_x, tile_y, tile_size, img_w, img_h
     )
 
     tile_ys, tile_xs = torch.meshgrid(
@@ -125,17 +122,21 @@ def compute_gaussian_weights_2d_tile(
     tile_xs = tile_xs + tile_xmin + 0.5
     tile_ys = tile_ys + tile_ymin + 0.5
 
-    # Dim = [tH, tW, 2]
-    tile_pixels = torch.stack([tile_xs, tile_ys], dim=-1)
+    # Dim = [mN, 1, 1, tK] - [1, tH, tW, 1] -> [mN, tH, tW, tK]
+    tile_xs = means2d[:, :, 0][:, None, None, :] - tile_xs[None, :, :, None]
+    tile_ys = means2d[:, :, 1][:, None, None, :] - tile_ys[None, :, :, None]
 
-    # Dim = [1, 1, tK, 2] - [tH, tW, 1, 2] -> [tH, tW, tK, 2]
-    tile_pixels = means2d[None, None, :, :] - tile_pixels[:, :, None, :]
+    # Dim = [mN, tH, tW, tK] * [mN, 1, 1, tK] -> [mN, tH, tW, tK]
+    tile_sigmas = 0.5 * (
+        tile_xs * tile_xs * conics2d[:, :, 0][:, None, None, :]
+        + 2.0 * tile_xs * tile_ys * conics2d[:, :, 1][:, None, None, :]
+        + tile_ys * tile_ys * conics2d[:, :, 2][:, None, None, :]
+    )
 
-    # Dim = [tK, 2, 2] * [tH, tW, tK, 1, 2]
-    tile_sigmas = 0.5 * torch.sum(conics2d * tile_pixels[:, :, :, None, :], dim=-1)
-
-    tile_gausses = torch.exp(-tile_sigmas)
-    return tile_gausses
+    # Dim = [mN, tH, tW, tK]
+    tile_gausses2d = torch.exp(-tile_sigmas)
+    tile_bbox = (tile_xmin, tile_ymin, crop_w, crop_h)
+    return tile_gausses2d, tile_bbox
 
 
 def compute_pinhole_jacobian(
@@ -241,7 +242,13 @@ def project_gaussians_3d_to_2d(
 
     # covars2d = [a, b, c, d]
     # inverse covars2d = 1.0 / (a * d - b * c) * [d, -b, -c, a]
-    conics2d = torch.zeros_like(covars2d)
+    n_views = view_mats.shape[0]
+    n_splats = means3d.shape[0]
+    conics2d = torch.zeros(
+        size=[n_views, n_splats, 3],
+        dtype=covars2d.dtype,
+        device=covars2d.device,
+    )
 
     a = covars2d[:, :, 0, 0] + 0.3
     b = covars2d[:, :, 0, 1]
@@ -251,13 +258,12 @@ def project_gaussians_3d_to_2d(
     # Dim = [mN, tK]
     det = 1.0 / (a * d - b * c + EPS)
 
-    conics2d[:, :, 0, 0] = d
-    conics2d[:, :, 0, 1] = -b
-    conics2d[:, :, 1, 0] = -c
-    conics2d[:, :, 1, 1] = a
+    conics2d[:, :, 0] = d
+    conics2d[:, :, 1] = -(b + c) / 2.0
+    conics2d[:, :, 2] = a
 
-    # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
-    conics2d = conics2d * det[:, :, None, None]
+    # Dim = [mN, tK, 3] * [mN, tK, 1]
+    conics2d = conics2d * det[:, :, None]
 
     # Dim = [mN, tK]
     depths = cam_means3d[..., 2]
@@ -401,8 +407,7 @@ def combine_sh_colors_from_coefficients(
 def rasterize_to_pixels_tile_forward(
     tile_x: int,
     tile_y: int,
-    tile_w: int,
-    tile_h: int,
+    tile_size: int,
     img_w: int,
     img_h: int,
     means3d: torch.FloatTensor,  # Dim = [tK, 3]
@@ -417,15 +422,20 @@ def rasterize_to_pixels_tile_forward(
     # Dim = [tK, 3, 3]
     covars3d = compute_covariance_3d(quats, scales)
 
-    # Dim = [mN, tK, 2]
-    means2d = project_means_3d_to_2d(means3d, view_mats, cam_mats)
+    means2d, conics2d, depths, radii = project_gaussians_3d_to_2d(
+        view_mats, cam_mats, means3d, covars3d, img_w, img_h
+    )
 
-    # Dim = [mN, tK, 2, 2]
-    conics2d = project_covariances_3d_to_2d(view_mats, cam_mats, means3d, covars3d)
+    assert torch.all(
+        depths[:-1] <= depths[1:]
+    ), f"Depth should be sorted within a tile!"
+
+    # Dim = [mN, tK]
+    masks = (radii > 0).all(dim=-1).float()
 
     # Dim = [mN, tH, tW, tK]
-    tile_gausses2d = compute_gaussian_weights_2d_tile(
-        tile_x, tile_y, tile_w, tile_h, img_w, img_h, means2d, conics2d
+    tile_gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
+        tile_x, tile_y, tile_size, img_w, img_h, means2d, conics2d
     )
 
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
@@ -437,11 +447,11 @@ def rasterize_to_pixels_tile_forward(
     tile_alphas = torch.clamp_max(tile_alphas, 0.9999)
 
     # Dim = [mN, tH, tW, tK]
-    blend_alphas = 1.0 - tile_alphas
     blend_alphas = torch.cumprod(1.0 - tile_alphas, dim=-1)
     blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
     blend_alphas[:, :, 0] = 1.0
 
+    # Dim = [mN, tH, tW, mC]
     tile_rgb = torch.sum(
         tile_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
         * blend_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
@@ -449,5 +459,6 @@ def rasterize_to_pixels_tile_forward(
         dim=-2,
     )
 
+    # Dim = [mN, tH, tW, 1]
     tile_a = 1.0 - blend_alphas[:, :, :, -1, None]
-    return tile_rgb, tile_a
+    return tile_rgb, tile_a, tile_bbox
