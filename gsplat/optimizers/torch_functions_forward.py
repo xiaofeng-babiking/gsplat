@@ -207,6 +207,8 @@ def project_gaussians_3d_to_2d(
     img_h: int,
     near_plane: float = 0.1,
     far_plane: float = 1e10,
+    opacities: Optional[torch.FloatTensor] = None,
+    alpha_threshold: float = 1.0 / 255.0,
 ):
     """Project 3D means and covariance matrix to 2D.
 
@@ -217,6 +219,8 @@ def project_gaussians_3d_to_2d(
         [4] covars3d: Dim = [tK, 3, 3]
         [5] img_w: int
         [6] img_h: int
+        [7] opacities: [tK]
+        [8] alpha_threshold: float
 
     Return:
         [1] covars2d: Dim = [mN, tK, 2, 2]
@@ -225,6 +229,9 @@ def project_gaussians_3d_to_2d(
         covars2d = J @ W @ covars3d @ W.T @ J.T
     """
     cam_means3d, means2d = project_points_3d_to_2d(means3d, view_mats, cam_mats)
+
+    # Dim = [mN, tK]
+    depths = cam_means3d[..., 2]
 
     # Dim = [mN, 3, 3]
     rot_mats = view_mats[:, :3, :3]
@@ -256,20 +263,29 @@ def project_gaussians_3d_to_2d(
     d = covars2d[:, :, 1, 1] + 0.3
 
     # Dim = [mN, tK]
-    det = 1.0 / (a * d - b * c + EPS)
+    det = a * d - b * c
 
     conics2d[:, :, 0] = d
     conics2d[:, :, 1] = -(b + c) / 2.0
     conics2d[:, :, 2] = a
 
     # Dim = [mN, tK, 3] * [mN, tK, 1]
-    conics2d = conics2d * det[:, :, None]
+    conics2d = conics2d / (det[:, :, None] + EPS)
 
-    # Dim = [mN, tK]
-    depths = cam_means3d[..., 2]
+    extend = (torch.ones_like(opacities) * 3.33) if opacities is not None else 3.33
+    if opacities is not None:
+        det_raw = (a - 0.3) * (d - 0.3) - b * c
+        compensate = torch.sqrt(torch.clamp(det_raw / (det + EPS), min=0.0))
 
-    radius_x = torch.ceil(3.33 * torch.sqrt(covars2d[..., 0, 0]))
-    radius_y = torch.ceil(3.33 * torch.sqrt(covars2d[..., 1, 1]))
+        opacities = opacities * compensate
+        opacities = torch.where(opacities > alpha_threshold, opacities, 0.0)
+
+        extend = torch.minimum(
+            extend, torch.sqrt(2.0 * torch.log(opacities / alpha_threshold))
+        )
+
+    radius_x = torch.ceil(extend * torch.sqrt(covars2d[..., 0, 0]))
+    radius_y = torch.ceil(extend * torch.sqrt(covars2d[..., 1, 1]))
     # Dim = [mN, tK, 2]
     radius = torch.stack([radius_x, radius_y], dim=-1)
 
@@ -277,7 +293,8 @@ def project_gaussians_3d_to_2d(
     radius[~valid] = 0.0
 
     inside = (
-        (means2d[..., 0] + radius[..., 0] > 0)
+        (opacities > alpha_threshold)
+        & (means2d[..., 0] + radius[..., 0] > 0)
         & (means2d[..., 0] - radius[..., 0] < img_w)
         & (means2d[..., 1] + radius[..., 1] > 0)
         & (means2d[..., 1] - radius[..., 1] < img_h)
@@ -285,7 +302,7 @@ def project_gaussians_3d_to_2d(
     radius[~inside] = 0.0
 
     radii = radius.int()
-    return means2d, conics2d, depths, radii
+    return means2d, conics2d, depths, radii, opacities
 
 
 def combine_sh_colors_from_coefficients(
@@ -422,8 +439,8 @@ def rasterize_to_pixels_tile_forward(
     # Dim = [tK, 3, 3]
     covars3d = compute_covariance_3d(quats, scales)
 
-    means2d, conics2d, depths, radii = project_gaussians_3d_to_2d(
-        view_mats, cam_mats, means3d, covars3d, img_w, img_h
+    means2d, conics2d, depths, radii, _ = project_gaussians_3d_to_2d(
+        view_mats, cam_mats, means3d, covars3d, img_w, img_h, opacities=opacities
     )
 
     assert torch.all(
@@ -455,7 +472,8 @@ def rasterize_to_pixels_tile_forward(
     tile_rgb = torch.sum(
         tile_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
         * blend_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
-        * sh_colors[:, None, None, :, :],  # Dim = [mN, 1,  1,  tK, mC]
+        * sh_colors[:, None, None, :, :]  # Dim = [mN, 1,  1,  tK, mC]
+        * masks[:, None, None, :, None],  # Dim = [mN, 1, 1, tK, 1]
         dim=-2,
     )
 

@@ -177,8 +177,8 @@ def test_rasterization_tile_forward():
     img_w = rd_meta["width"]
     img_h = rd_meta["height"]
     tile_size = rd_meta["tile_size"]
-    tile_w = math.ceil(img_w / tile_size)
-    tile_h = math.ceil(img_h / tile_size)
+    tile_w = int(math.ceil(img_w / tile_size))
+    tile_h = int(math.ceil(img_h / tile_size))
     isect_offsets = rd_meta["isect_offsets"]
     assert isect_offsets.shape == (1, tile_h, tile_w)
     flatten_ids = rd_meta["flatten_ids"]
@@ -213,9 +213,11 @@ def test_rasterization_tile_forward():
         covars3d_fwd, covars3d_fwd.transpose(-1, -2)
     ), f"Covariance 3D NOT symmetric!"
 
-    means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd = project_gaussians_3d_to_2d(
-        view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h
+    means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd, _ = project_gaussians_3d_to_2d(
+        view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h, opacities=opacities
     )
+    assert torch.allclose(opacities, rd_meta["opacities"], atol=1e-4, rtol=1e-3)
+
     means2d_meta = rd_meta["means2d"]
     assert torch.allclose(
         means2d_fwd[0], means2d_meta, atol=1e-4, rtol=1e-2
@@ -232,12 +234,23 @@ def test_rasterization_tile_forward():
     ), f"Depth 2D projection failed!"
 
     radii_meta = rd_meta["radii"]
-    valid_fwd = (radii_fwd[0] > 0).all(dim=-1)
-    valid_meta = (radii_meta > 0).all(dim=-1)
-    ratio = (valid_meta == valid_fwd).sum() / valid_meta.numel()
-    assert ratio > 0.999, f"Radius 2D projection failed!"
+    torch.allclose(radii_fwd[0], radii_meta), f"Radius int failed!"
 
     # 3. test whole image rendering
+    from gsplat.optimizers.sparse_newton import GSGroupNewtonOptimizer
+
+    cache = GSGroupNewtonOptimizer._cache_tile_to_splat_alphas(
+        gauss_ids,
+        means2d_fwd[0],
+        conics2d_fwd[0],
+        opacities,
+        img_h,
+        img_w,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+    )
+
     ssimer = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
     fwd_img = torch.zeros(size=[1, img_h, img_w, 3], dtype=torch.float32, device=device)
@@ -279,17 +292,28 @@ def test_rasterization_tile_forward():
             tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
             tile_xmin, tile_ymin, crop_w, crop_h = tile_bbox
 
+            tile_alphas = cache[tile_idx]["tile_alphas"]
+            blend_alphas = cache[tile_idx]["blend_alphas"]
+            flat_idxs = cache[tile_idx]["tile_splat_indices"]
+            cache_rgb = torch.sum(
+                tile_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+                * blend_alphas[:, :, :, None]  # [tile_size, tile_size, tK, 1]
+                * sh_colors_fwd[0, flat_idxs, :][None, None, :, :],  # [1, 1, tK, 3]
+                dim=-2,
+            )[None]
+            cache_rgb = torch.clamp(cache_rgb, min=0.0, max=1.0)
+
             rd_rgb = rd_img[
-                :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w, :
+                :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w), :
             ]
 
-            ssim = ssimer(rd_rgb.permute([0, 3, 1, 2]), tile_rgb.permute([0, 3, 1, 2]))
+            ssim = ssimer(rd_rgb.permute([0, 3, 1, 2]), cache_rgb.permute([0, 3, 1, 2]))
             LOGGER.info(
                 f"Tile=({tile_x}, {tile_y}), Elapsed={tile_elapsed:.4f} seconds, SSIM={ssim:.4f}."
             )
 
             fwd_img[
-                :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w, :
+                :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w), :
             ] = tile_rgb[:, :crop_h, :crop_w, :]
 
 
