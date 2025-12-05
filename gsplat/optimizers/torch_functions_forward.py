@@ -6,33 +6,34 @@ from typing import Optional
 EPS = 1e-12
 
 
-def project_means_3d_to_2d(
-    means3d: torch.FloatTensor,
+def project_points_3d_to_2d(
+    pnts3d: torch.FloatTensor,
     view_mats: torch.FloatTensor,
     cam_mats: torch.FloatTensor,
 ) -> torch.FloatTensor:
     """Project means from 3d world to 2d image plane.
 
     Args:
-        [1] means3d: gaussian splats' 3D positions, i.e. [tK, 3]
+        [1] pnts3d: 3D positions at World Coordinate system, i.e. [tK, 3]
         [2] view_mat: view matrix, i.e. [mN, 4, 4]
         [3] cam_mat: camera matrix, i.e. [mN, 3, 3]
 
     Return:
-        [1] means2d: gaussian splats' 2D positions, i.e. [tK, 2]
+        [1] cam_pnts3d: 3D positions at Camera coordinate system.
+        [2] img_pnts2d: 2D pixels, i.e. [tK, 2]
     """
     # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
-    cam_means3d = (
-        torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
+    cam_pnts3d = (
+        torch.sum(view_mats[:, None, :3, :3] * pnts3d[None, :, None, :], dim=-1)
         + view_mats[:, :3, 3][:, None, :]
     )
 
     # Dim = [mN, 1, 3, 3] * [mN, tK, 1, 3] -> [mN, tK, 3]
-    means2d = torch.sum(cam_mats[:, None, :, :] * cam_means3d[:, :, None, :], dim=-1)
+    img_pnts2d = torch.sum(cam_mats[:, None, :, :] * cam_pnts3d[:, :, None, :], dim=-1)
 
     # Dim = [mN, tK, 2]
-    means2d = means2d[:, :, :2] / means2d[:, :, 2][..., None]
-    return means2d
+    img_pnts2d = img_pnts2d[:, :, :2] / img_pnts2d[:, :, 2][..., None]
+    return cam_pnts3d, img_pnts2d
 
 
 def get_tile_size(
@@ -80,6 +81,7 @@ def compute_covariance_3d(
     rot_mats = quaternion_to_rotation_matrix(quats)
 
     covars3d = rot_mats * scales[..., None, :]  # [tK, 3, 3]
+    covars3d = torch.bmm(covars3d, covars3d.transpose(-1, -2))
     return covars3d
 
 
@@ -195,16 +197,17 @@ def compute_pinhole_jacobian(
     return pin_jacob
 
 
-def project_covariances_3d_to_2d(
+def project_gaussians_3d_to_2d(
     view_mats: torch.FloatTensor,
     cam_mats: torch.FloatTensor,
     means3d: torch.FloatTensor,
     covars3d: torch.FloatTensor,
     img_w: int,
     img_h: int,
-    with_inverse: bool = True,
+    near_plane: float = 0.1,
+    far_plane: float = 1e10,
 ):
-    """Project 3D covariance matrix to 2D inverse.
+    """Project 3D means and covariance matrix to 2D.
 
     Args:
         [1] view_mats: Dim = [mN, 4, 4]
@@ -213,7 +216,6 @@ def project_covariances_3d_to_2d(
         [4] covars3d: Dim = [tK, 3, 3]
         [5] img_w: int
         [6] img_h: int
-        [7] with_inverse: bool
 
     Return:
         [1] covars2d: Dim = [mN, tK, 2, 2]
@@ -221,11 +223,7 @@ def project_covariances_3d_to_2d(
 
         covars2d = J @ W @ covars3d @ W.T @ J.T
     """
-    # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
-    cam_means3d = (
-        torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
-        + view_mats[:, :3, 3][:, None, :]
-    )
+    cam_means3d, means2d = project_points_3d_to_2d(means3d, view_mats, cam_mats)
 
     # Dim = [mN, 3, 3]
     rot_mats = view_mats[:, :3, :3]
@@ -236,7 +234,6 @@ def project_covariances_3d_to_2d(
 
     # Dim = [mN, tK, 2, 3]
     pin_jacob = compute_pinhole_jacobian(cam_mats, cam_means3d, img_w, img_h)
-
     # Dim = [mN, tK, 2, 3] @ [mN, tK, 3, 3] @ [mN, tK, 2, 3].T
     covars2d = torch.einsum(
         "ijkl,ijlm,ijmn->ijkn", pin_jacob, cam_covars3d, pin_jacob.transpose(-1, -2)
@@ -244,25 +241,45 @@ def project_covariances_3d_to_2d(
 
     # covars2d = [a, b, c, d]
     # inverse covars2d = 1.0 / (a * d - b * c) * [d, -b, -c, a]
-    conics2d = None
-    if with_inverse:
-        conics2d = torch.zeros_like(covars2d)
+    conics2d = torch.zeros_like(covars2d)
 
-        a = covars2d[:, :, 0, 0] + 0.3  # NOTE. for numerical stability
-        b = covars2d[:, :, 0, 1]
-        c = covars2d[:, :, 1, 0]
-        d = covars2d[:, :, 1, 1] + 0.3  # NOTE. for numerical stability
+    a = covars2d[:, :, 0, 0] + 0.3
+    b = covars2d[:, :, 0, 1]
+    c = covars2d[:, :, 1, 0]
+    d = covars2d[:, :, 1, 1] + 0.3
 
-        det = 1.0 / (a * d - b * c + EPS)
+    # Dim = [mN, tK]
+    det = 1.0 / (a * d - b * c + EPS)
 
-        conics2d[:, :, 0, 0] = d
-        conics2d[:, :, 0, 1] = -b
-        conics2d[:, :, 1, 0] = -c
-        conics2d[:, :, 1, 1] = a
+    conics2d[:, :, 0, 0] = d
+    conics2d[:, :, 0, 1] = -b
+    conics2d[:, :, 1, 0] = -c
+    conics2d[:, :, 1, 1] = a
 
-        # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
-        conics2d = conics2d * det[:, :, None, None]
-    return covars2d, conics2d
+    # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
+    conics2d = conics2d * det[:, :, None, None]
+
+    # Dim = [mN, tK]
+    depths = cam_means3d[..., 2]
+
+    radius_x = torch.ceil(3.33 * torch.sqrt(covars2d[..., 0, 0]))
+    radius_y = torch.ceil(3.33 * torch.sqrt(covars2d[..., 1, 1]))
+    # Dim = [mN, tK, 2]
+    radius = torch.stack([radius_x, radius_y], dim=-1)
+
+    valid = (det > 0) & (depths > near_plane) & (depths < far_plane)
+    radius[~valid] = 0.0
+
+    inside = (
+        (means2d[..., 0] + radius[..., 0] > 0)
+        & (means2d[..., 0] - radius[..., 0] < img_w)
+        & (means2d[..., 1] + radius[..., 1] > 0)
+        & (means2d[..., 1] - radius[..., 1] < img_h)
+    )
+    radius[~inside] = 0.0
+
+    radii = radius.int()
+    return means2d, conics2d, depths, radii
 
 
 def combine_sh_colors_from_coefficients(

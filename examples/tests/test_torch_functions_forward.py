@@ -190,14 +190,7 @@ def test_rasterization_tile_forward():
     quats = splats["quats"][gauss_ids]
     sh_coeffs = torch.cat([splats["sh0"][gauss_ids], splats["shN"][gauss_ids]], dim=1)
 
-    # 1. test means 3d to 2d projection
-    means2d_fwd = project_means_3d_to_2d(means3d, view_mat, cam_mat)
-    means2d_meta = rd_meta["means2d"]
-    assert torch.allclose(
-        means2d_fwd, means2d_meta, rtol=1e-4, atol=1e-3
-    ), f"Project means 3d to 2d failed!"
-
-    # 2. test spherical harmonics colors
+    # 1. test spherical harmonics colors
     sh_deg = int(np.sqrt(sh_coeffs.shape[-2])) - 1
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mat)[:, :3, 3][:, None, :]
     sh_colors_fwd = combine_sh_colors_from_coefficients(view_dirs, sh_coeffs)
@@ -206,15 +199,20 @@ def test_rasterization_tile_forward():
         sh_colors_fwd, sh_colors_meta, atol=1e-4, rtol=1e-3
     ), f"Spherical harmonics colors failed!"
 
-    # 3. test inverse covariance 2d
+    # 2. test 3D to 2D projection
     covars3d_fwd = compute_covariance_3d(quats, scales)
     assert torch.allclose(
         covars3d_fwd, covars3d_fwd.transpose(-1, -2)
     ), f"Covariance 3D NOT symmetric!"
 
-    _, conics2d_fwd = project_covariances_3d_to_2d(
+    means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd = project_gaussians_3d_to_2d(
         view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h
     )
+    means2d_meta = rd_meta["means2d"]
+    assert torch.allclose(
+        means2d_fwd[0], means2d_meta, atol=1e-4, rtol=1e-2
+    ), f"Means 2D projection failed!"
+
     conics2d_meta = rd_meta["conics"]
     assert torch.allclose(
         conics2d_fwd[0, :, 0, 0], conics2d_meta[:, 0], atol=1e-4, rtol=1e-3
@@ -225,6 +223,17 @@ def test_rasterization_tile_forward():
     assert torch.allclose(
         conics2d_fwd[0, :, 1, 1], conics2d_meta[:, 2], atol=1e-4, rtol=1e-3
     ), "Inverse covariance 2D YY failed!"
+
+    depths_meta = rd_meta["depths"]
+    assert torch.allclose(
+        depths_fwd[0], depths_meta, atol=1e-4, rtol=1e-3
+    ), f"Depth 2D projection failed!"
+
+    radii_meta = rd_meta["radii"]
+    valid_fwd = (radii_fwd[0] > 0).all(dim=-1)
+    valid_meta = (radii_meta > 0).all(dim=-1)
+    ratio = (valid_meta == valid_fwd).sum() / valid_meta.numel()
+    assert ratio > 0.999, f"Radius 2D projection failed!"
 
 
 if __name__ == "__main__":
