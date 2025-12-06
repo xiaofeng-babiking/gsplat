@@ -1,15 +1,11 @@
 import os
 import sys
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-sys.path.append("/home/babiking/mnt/Codebases.writable-by-babiking/gsplat")
 
-import re
 import time
 import random
 import torch
-import cv2 as cv
 import numpy as np
 from tqdm import tqdm
 from collections import namedtuple
