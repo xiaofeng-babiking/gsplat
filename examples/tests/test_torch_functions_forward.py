@@ -167,7 +167,6 @@ def test_rasterization_tile_forward():
     view_idx = random.choice(list(range(cam_mats.shape[0])))
 
     rd_img = rd_imgs[view_idx, :, :, :][None]
-    rd_img = rd_img.permute([0, 2, 3, 1])  # NCHW -> NHWC
     cam_mat = cam_mats[view_idx, :, :][None]
     view_mat = view_mats[view_idx, :, :][None]
     rd_meta = rd_metas[view_idx]
@@ -243,7 +242,7 @@ def test_rasterization_tile_forward():
     # 3. test whole image rendering
     ssimer = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
-    fwd_img = torch.zeros(size=[1, img_h, img_w, 3], dtype=torch.float32, device=device)
+    fwd_img = torch.zeros(size=[1, 3, img_h, img_w], dtype=torch.float32, device=device)
     isect_offsets = isect_offsets.flatten()
     for tile_x in range(tile_w):
         for tile_y in range(tile_h):
@@ -280,17 +279,16 @@ def test_rasterization_tile_forward():
             end = time.time()
             tile_elapsed = float(end - start)
 
-            tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
             tile_xmin, tile_ymin, crop_w, crop_h = tile_bbox
 
             rd_rgb = rd_img[
-                :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w), :
+                :, :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w)
             ]
 
             if crop_h < 5 or crop_w < 5:
                 continue
 
-            ssim = ssimer(rd_rgb.permute([0, 3, 1, 2]), tile_rgb.permute([0, 3, 1, 2]))
+            ssim = ssimer(rd_rgb, tile_rgb)
             assert (
                 ssim > 0.980
             ), f"View={view_idx}, Tile=({tile_x},  {tile_y}), SSIM={ssim:.4f}, render failed!"
@@ -299,9 +297,9 @@ def test_rasterization_tile_forward():
             )
 
             fwd_img[
-                :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w), :
-            ] = tile_rgb[:, :crop_h, :crop_w, :]
-    ssim = ssimer(rd_img.permute([0, 3, 1, 2]), fwd_img.permute([0, 3, 1, 2]))
+                :, :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w)
+            ] = tile_rgb[:, :, :crop_h, :crop_w]
+    ssim = ssimer(rd_img, fwd_img)
     assert ssim > 0.99, f"View=({view_idx}) render failed!"
 
 

@@ -487,6 +487,8 @@ def rasterize_to_pixels_tile_forward(
         * masks[:, None, None, :, None],  # Dim = [mN, 1, 1, tK, 1]
         dim=-2,
     )
+    tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
+    tile_rgb = tile_rgb.permute([0, 3, 1, 2])
 
     # Dim = [mN, tH, tW, 1]
     tile_a = 1.0 - blend_alphas[:, :, :, -1, None]
