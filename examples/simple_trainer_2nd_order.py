@@ -233,10 +233,6 @@ def train():
             )
 
             n_splats = len(flat_idxs)
-            LOGGER.info(
-                f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}."
-            )
-
             for i in tqdm(
                 range(FLAGS.train_steps),
                 total=FLAGS.train_steps,
@@ -244,7 +240,7 @@ def train():
             ):
                 l2_loss = forward_func(tile_means3d)
                 LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), Step={i}, L2={l2_loss:.4f}."
+                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, L2={l2_loss:.4f}."
                 )
 
                 start = time.time()
@@ -254,7 +250,7 @@ def train():
                 end = time.time()
                 jacob_elapsed = float(end - start)
                 LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), Step={i}, Jacobian={jacob_elapsed:.4f} seconds."
+                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, Jacobian={jacob_elapsed:.4f} seconds."
                 )
 
                 start = time.time()
@@ -263,17 +259,19 @@ def train():
                 end = time.time()
                 hess_elapsed = float(end - start)
                 LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), Step={i}, Hessian={hess_elapsed:.4f} seconds."
+                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, Hessian={hess_elapsed:.4f} seconds."
                 )
 
-                assert torch.any(torch.abs(hess) >= 0.0)
-                
+                assert torch.any(
+                    torch.abs(hess) >= 1e-6
+                ), f"Singular Hessian Matrix View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}!"
+
                 start = time.time()
                 hess_inv = torch.linalg.pinv(hess)
                 end = time.time()
                 hess_inv_elapsed = float(end - start)
                 LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), Step={i}, InverseHessian={hess_inv_elapsed:.4f} seconds."
+                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, InverseHessian={hess_inv_elapsed:.4f} seconds."
                 )
 
                 delta_means3d = -torch.matmul(hess_inv, jacob).reshape([n_splats, 3])
