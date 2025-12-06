@@ -261,7 +261,6 @@ def project_gaussians_3d_to_2d(
     b = covars2d[:, :, 0, 1]
     c = covars2d[:, :, 1, 0]
     d = covars2d[:, :, 1, 1] + 0.3
-
     # Dim = [mN, tK]
     det = a * d - b * c
 
@@ -278,7 +277,6 @@ def project_gaussians_3d_to_2d(
         compensate = torch.sqrt(torch.clamp(det_raw / (det + EPS), min=0.0))
 
         opacities = opacities * compensate
-        opacities = torch.where(opacities > alpha_threshold, opacities, 0.0)
 
         extend = torch.minimum(
             extend, torch.sqrt(2.0 * torch.log(opacities / alpha_threshold))
@@ -292,9 +290,12 @@ def project_gaussians_3d_to_2d(
     valid = (det > 0) & (depths > near_plane) & (depths < far_plane)
     radius[~valid] = 0.0
 
+    if opacities is not None:
+        valid = opacities >= alpha_threshold
+        radius[~valid, :] = 0.0
+
     inside = (
-        (opacities > alpha_threshold)
-        & (means2d[..., 0] + radius[..., 0] > 0)
+        (means2d[..., 0] + radius[..., 0] > 0)
         & (means2d[..., 0] - radius[..., 0] < img_w)
         & (means2d[..., 1] + radius[..., 1] > 0)
         & (means2d[..., 1] - radius[..., 1] < img_h)
@@ -434,13 +435,21 @@ def rasterize_to_pixels_tile_forward(
     sh_coeffs: torch.FloatTensor,  # Dim = [tK, (L + 1)^2, 3]
     cam_mats: torch.FloatTensor,  # Dim = [mN, 3, 3]
     view_mats: torch.FloatTensor,  # Dim =[mN, 4, 4]
+    with_compensate: bool = False,
+    masks: Optional[torch.FloatTensor] = None,
 ):
     """Torch tile-based rasterization implementation."""
     # Dim = [tK, 3, 3]
     covars3d = compute_covariance_3d(quats, scales)
 
     means2d, conics2d, depths, radii, _ = project_gaussians_3d_to_2d(
-        view_mats, cam_mats, means3d, covars3d, img_w, img_h, opacities=opacities
+        view_mats,
+        cam_mats,
+        means3d,
+        covars3d,
+        img_w,
+        img_h,
+        opacities=opacities if with_compensate else None,
     )
 
     assert torch.all(
@@ -448,7 +457,8 @@ def rasterize_to_pixels_tile_forward(
     ), f"Depth should be sorted within a tile!"
 
     # Dim = [mN, tK]
-    masks = (radii > 0).all(dim=-1).float()
+    if masks is None:
+        masks = (radii > 0).all(dim=-1).float()
 
     # Dim = [mN, tH, tW, tK]
     tile_gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
@@ -458,6 +468,7 @@ def rasterize_to_pixels_tile_forward(
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
     # Dim = [mN, tK, mC]
     sh_colors = combine_sh_colors_from_coefficients(view_dirs, sh_coeffs)
+    sh_colors = torch.clamp_min(sh_colors + 0.5, 0.0)
 
     # Dim = [mN, tH, tW, tK]
     tile_alphas = tile_gausses2d * opacities
@@ -466,7 +477,7 @@ def rasterize_to_pixels_tile_forward(
     # Dim = [mN, tH, tW, tK]
     blend_alphas = torch.cumprod(1.0 - tile_alphas, dim=-1)
     blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
-    blend_alphas[:, :, 0] = 1.0
+    blend_alphas[:, :, :, 0] = 1.0
 
     # Dim = [mN, tH, tW, mC]
     tile_rgb = torch.sum(
