@@ -143,6 +143,8 @@ def train():
         f"Load trained 3DGS model with {means3d.shape[0]} splats with degree={sh_deg}."
     )
 
+    means3d = means3d + FLAGS.noise_level * torch.randn_like(means3d)
+
     view_idx = random.choice(list(range(len(img_ids))))
 
     gt_img = gt_imgs[view_idx].unsqueeze(0)
@@ -179,8 +181,6 @@ def train():
     isect_offsets = rd_meta["isect_offsets"]
     flatten_ids = rd_meta["flatten_ids"]
     LOGGER.info(f"View={view_idx}, #Splats={len(gauss_ids)}.")
-
-    means3d = means3d + FLAGS.noise_level * torch.randn_like(means3d)
 
     tile_size = rd_meta["tile_size"]
     tile_w = int(math.ceil(img_w / tile_size))
