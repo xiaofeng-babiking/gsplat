@@ -44,7 +44,7 @@ gflags.DEFINE_integer(
 gflags.DEFINE_string("data_split", "test", "Dataset split train or test.")
 gflags.DEFINE_integer("test_every", 8, "Test every this many frames.")
 gflags.DEFINE_integer("train_steps", 50, "Number of train iteration steps.")
-gflags.DEFINE_float("noise_level", 0.1, "Random noise level.")
+gflags.DEFINE_float("noise_level", 0.15, "Random noise level.")
 gflags.DEFINE_string("output_path", "./outputs", "Path to save training outputs.")
 
 
@@ -143,7 +143,7 @@ def train():
         f"Load trained 3DGS model with {means3d.shape[0]} splats with degree={sh_deg}."
     )
 
-    view_idx = random.choice(list(range(len(img_ids))))
+    view_idx = 0  # random.choice(list(range(len(img_ids))))
 
     gt_img = gt_imgs[view_idx].unsqueeze(0)
     rd_img, _, rd_meta = rasterization(
@@ -266,7 +266,7 @@ def train():
     )
 
     for i in tqdm(
-        range(FLAGS.train_steps),
+        range(1, FLAGS.train_steps + 1),
         total=FLAGS.train_steps,
         desc=f"train tile=({tile_x}, {tile_y}) 2nd-order...",
     ):
