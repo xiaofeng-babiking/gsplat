@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import torch
 from tqdm import tqdm
 from typing import Literal
+from torch.utils.tensorboard import SummaryWriter
 from datasets.colmap import Parser as ColmapParser
 from datasets.colmap import Dataset as ColmapDataset
 from gsplat.rendering import rasterization
@@ -42,8 +43,8 @@ gflags.DEFINE_integer(
 )
 gflags.DEFINE_string("data_split", "test", "Dataset split train or test.")
 gflags.DEFINE_integer("test_every", 8, "Test every this many frames.")
-gflags.DEFINE_integer("train_steps", 10, "Number of train iteration steps.")
-gflags.DEFINE_float("noise_level", 0.5, "Random noise level.")
+gflags.DEFINE_integer("train_steps", 50, "Number of train iteration steps.")
+gflags.DEFINE_float("noise_level", 0.1, "Random noise level.")
 gflags.DEFINE_string("output_path", "./outputs", "Path to save training outputs.")
 
 
@@ -142,9 +143,6 @@ def train():
         f"Load trained 3DGS model with {means3d.shape[0]} splats with degree={sh_deg}."
     )
 
-    means3d = means3d + torch.randn_like(means3d) * FLAGS.noise_level
-    LOGGER.info(f"Noise ({FLAGS.noise_level}) added into parameters.")
-
     view_idx = random.choice(list(range(len(img_ids))))
 
     gt_img = gt_imgs[view_idx].unsqueeze(0)
@@ -188,94 +186,162 @@ def train():
     assert isect_offsets.shape == (1, tile_h, tile_w)
     isect_offsets = isect_offsets[0].flatten()
 
-    for tile_x in range(tile_w):
-        for tile_y in range(tile_h):
-            tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
-                tile_x, tile_y, tile_size, img_w, img_h
-            )
+    writer_1st = SummaryWriter(log_dir=os.path.join(out_path, "1st"))
+    writer_2nd = SummaryWriter(log_dir=os.path.join(out_path, "2nd"))
 
-            tile_gt_img = gt_img[
-                :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
-            ]
+    tile_x = tile_w // 2
+    tile_y = tile_h // 2
 
-            tile_idx = tile_y * tile_w + tile_x
-            isect_start = isect_offsets[tile_idx]
-            isect_end = (
-                isect_offsets[tile_idx + 1]
-                if tile_idx < tile_w * tile_h - 1
-                else len(flatten_ids)
-            )
-            flat_idxs = flatten_ids[isect_start:isect_end]
+    tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
+        tile_x, tile_y, tile_size, img_w, img_h
+    )
 
-            tile_means3d = means3d[flat_idxs]
-            tile_quats = quats[flat_idxs]
-            tile_scales = scales[flat_idxs]
-            tile_opacities = opacities[flat_idxs]
-            tile_sh_coeffs = sh_coeffs[flat_idxs]
+    tile_gt_img = gt_img[
+        :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
+    ]
 
-            render_func = lambda _tile_means: rasterize_to_pixels_tile_forward(
-                tile_x,
-                tile_y,
-                tile_size,
-                img_w,
-                img_h,
-                _tile_means,
-                tile_quats,
-                tile_scales,
-                tile_opacities,
-                tile_sh_coeffs,
-                cam_mats[view_idx][None],
-                view_mats[view_idx][None],
-            )
+    writer_1st.add_image(
+        f"Groundtruth_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+        tile_gt_img[0],
+        global_step=0,
+    )
 
-            forward_func = lambda _tile_means: l2_loss_func(
-                render_func(_tile_means)[0], tile_gt_img
-            )
+    tile_idx = tile_y * tile_w + tile_x
+    isect_start = isect_offsets[tile_idx]
+    isect_end = (
+        isect_offsets[tile_idx + 1]
+        if tile_idx < tile_w * tile_h - 1
+        else len(flatten_ids)
+    )
+    flat_idxs = flatten_ids[isect_start:isect_end]
 
-            n_splats = len(flat_idxs)
-            for i in tqdm(
-                range(FLAGS.train_steps),
-                total=FLAGS.train_steps,
-                desc=f"train tile=({tile_x}, {tile_y}) 2nd-order...",
-            ):
-                l2_loss = forward_func(tile_means3d)
-                LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, L2={l2_loss:.4f}."
-                )
+    tile_means3d = means3d[flat_idxs]
+    tile_means3d = tile_means3d + torch.randn_like(tile_means3d) * FLAGS.noise_level
+    writer_1st.add_scalar("Noise", FLAGS.noise_level, global_step=0)
 
-                start = time.time()
-                # Means3d Dim = [tK, 3]
-                jacob = torch.autograd.functional.jacobian(forward_func, tile_means3d)
-                jacob = jacob.reshape([n_splats * 3, 1])
-                end = time.time()
-                jacob_elapsed = float(end - start)
-                LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, Jacobian={jacob_elapsed:.4f} seconds."
-                )
+    tile_means3d_1st = tile_means3d.clone().detach()
+    tile_means3d_2nd = tile_means3d.clone().detach()
+    tile_quats = quats[flat_idxs]
+    tile_scales = scales[flat_idxs]
+    tile_opacities = opacities[flat_idxs]
+    tile_sh_coeffs = sh_coeffs[flat_idxs]
 
-                start = time.time()
-                hess = torch.autograd.functional.hessian(forward_func, tile_means3d)
-                hess = hess.reshape([n_splats * 3, n_splats * 3])
-                end = time.time()
-                hess_elapsed = float(end - start)
-                LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, Hessian={hess_elapsed:.4f} seconds."
-                )
+    n_splats = len(flat_idxs)
+    writer_1st.add_scalar("#Splats", n_splats, global_step=0)
 
-                assert torch.any(
-                    torch.abs(hess) >= 1e-6
-                ), f"Singular Hessian Matrix View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}!"
+    render_func = lambda _tile_means: rasterize_to_pixels_tile_forward(
+        tile_x,
+        tile_y,
+        tile_size,
+        img_w,
+        img_h,
+        _tile_means,
+        tile_quats,
+        tile_scales,
+        tile_opacities,
+        tile_sh_coeffs,
+        cam_mats[view_idx][None],
+        view_mats[view_idx][None],
+    )
 
-                start = time.time()
-                hess_inv = torch.linalg.pinv(hess)
-                end = time.time()
-                hess_inv_elapsed = float(end - start)
-                LOGGER.info(
-                    f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}, InverseHessian={hess_inv_elapsed:.4f} seconds."
-                )
+    forward_func = lambda _tile_means: l2_loss_func(
+        render_func(_tile_means)[0], tile_gt_img
+    )
 
-                delta_means3d = -torch.matmul(hess_inv, jacob).reshape([n_splats, 3])
-                tile_means3d = tile_means3d + delta_means3d
+    init_l2_loss_1st = forward_func(tile_means3d_1st)
+    init_l2_loss_2nd = forward_func(tile_means3d_2nd)
+    LOGGER.info(
+        f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={len(flat_idxs)}, "
+        + f"L2_1st={init_l2_loss_1st.item():.6f}, L2_2nd={init_l2_loss_2nd.item():.6f}."
+    )
+    writer_1st.add_scalar(
+        f"L2_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+        init_l2_loss_1st.item(),
+        global_step=0,
+    )
+    writer_2nd.add_scalar(
+        f"L2_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+        init_l2_loss_2nd.item(),
+        global_step=0,
+    )
+
+    for i in tqdm(
+        range(FLAGS.train_steps),
+        total=FLAGS.train_steps,
+        desc=f"train tile=({tile_x}, {tile_y}) 2nd-order...",
+    ):
+        start = time.time()
+        jacob_1st = torch.autograd.functional.jacobian(forward_func, tile_means3d_1st)
+        end = time.time()
+        jacob_1st_elapsed = float(end - start)
+        tile_means3d_1st = tile_means3d_1st - 1e-4 * jacob_1st
+        tile_rd_img_1st = render_func(tile_means3d_1st)[0]
+        l2_loss_1st = torch.mean((tile_rd_img_1st - tile_gt_img) ** 2)
+        writer_1st.add_image(
+            f"Render_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+            tile_rd_img_1st[0],
+            global_step=i,
+        )
+        writer_1st.add_scalar(
+            f"L2_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+            l2_loss_1st.item(),
+            global_step=i,
+        )
+        writer_1st.add_scalar(f"Elapsed_Jacobian", jacob_1st_elapsed, global_step=i)
+
+        start = time.time()
+        # Means3d Dim = [tK, 3]
+        jacob_2nd = torch.autograd.functional.jacobian(forward_func, tile_means3d_2nd)
+        jacob_2nd = jacob_2nd.reshape([n_splats * 3, 1])
+        end = time.time()
+        jacob_2nd_elapsed = float(end - start)
+
+        start = time.time()
+        hess_2nd = torch.autograd.functional.hessian(forward_func, tile_means3d_2nd)
+        hess_2nd = hess_2nd.reshape([n_splats * 3, n_splats * 3])
+        end = time.time()
+        hess_2nd_elapsed = float(end - start)
+
+        assert torch.any(
+            torch.abs(hess_2nd) >= 1e-6
+        ), f"Singular Hessian Matrix View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, Step={i}!"
+
+        start = time.time()
+        hess_2nd_inv = torch.linalg.pinv(hess_2nd)
+        end = time.time()
+        hess_2nd_inv_elapsed = float(end - start)
+
+        delta_means3d_2nd = -torch.matmul(hess_2nd_inv, jacob_2nd).reshape(
+            [n_splats, 3]
+        )
+        tile_means3d_2nd = tile_means3d_2nd + delta_means3d_2nd
+
+        tile_rd_img_2nd = render_func(tile_means3d_2nd)[0]
+        l2_loss_2nd = torch.mean((tile_rd_img_2nd - tile_gt_img) ** 2)
+        LOGGER.info(
+            f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, "
+            + f"Step={i}, Jacobian={jacob_2nd_elapsed:.6f} seconds, "
+            + f"Hessian={hess_2nd_elapsed:.6f} seconds, InverseHessian={hess_2nd_inv_elapsed:.6f} seconds, "
+            + f"L2_1st={l2_loss_1st.item():.6f}, L2_2nd={l2_loss_2nd.item():.6f}."
+        )
+        writer_2nd.add_image(
+            f"Render_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+            tile_rd_img_2nd[0],
+            global_step=i,
+        )
+        writer_2nd.add_scalar(
+            f"L2_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
+            l2_loss_2nd.item(),
+            global_step=i,
+        )
+        writer_2nd.add_scalar(f"Elapsed_Jacobian", jacob_2nd_elapsed, global_step=i)
+        writer_2nd.add_scalar(f"Elapsed_Hessian", hess_2nd_elapsed, global_step=i)
+        writer_2nd.add_scalar(
+            f"Elapsed_Inverse_Hessian", hess_2nd_inv_elapsed, global_step=i
+        )
+
+    writer_1st.close()
+    writer_2nd.close()
 
 
 if __name__ == "__main__":
