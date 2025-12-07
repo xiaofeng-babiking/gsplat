@@ -143,7 +143,7 @@ def train():
         f"Load trained 3DGS model with {means3d.shape[0]} splats with degree={sh_deg}."
     )
 
-    view_idx = 0  # random.choice(list(range(len(img_ids))))
+    view_idx = random.choice(list(range(len(img_ids))))
 
     gt_img = gt_imgs[view_idx].unsqueeze(0)
     rd_img, _, rd_meta = rasterization(
@@ -180,6 +180,8 @@ def train():
     flatten_ids = rd_meta["flatten_ids"]
     LOGGER.info(f"View={view_idx}, #Splats={len(gauss_ids)}.")
 
+    means3d = means3d + FLAGS.noise_level * torch.randn_like(means3d)
+
     tile_size = rd_meta["tile_size"]
     tile_w = int(math.ceil(img_w / tile_size))
     tile_h = int(math.ceil(img_h / tile_size))
@@ -205,6 +207,7 @@ def train():
         tile_gt_img[0],
         global_step=0,
     )
+    writer_1st.add_scalar("Noise", FLAGS.noise_level, global_step=0)
 
     tile_idx = tile_y * tile_w + tile_x
     isect_start = isect_offsets[tile_idx]
@@ -216,9 +219,6 @@ def train():
     flat_idxs = flatten_ids[isect_start:isect_end]
 
     tile_means3d = means3d[flat_idxs]
-    tile_means3d = tile_means3d + torch.randn_like(tile_means3d) * FLAGS.noise_level
-    writer_1st.add_scalar("Noise", FLAGS.noise_level, global_step=0)
-
     tile_means3d_1st = tile_means3d.clone().detach()
     tile_means3d_2nd = tile_means3d.clone().detach()
     tile_quats = quats[flat_idxs]
@@ -276,7 +276,7 @@ def train():
         jacob_1st_elapsed = float(end - start)
         tile_means3d_1st = tile_means3d_1st - 1e-4 * jacob_1st
         tile_rd_img_1st = render_func(tile_means3d_1st)[0]
-        l2_loss_1st = torch.mean((tile_rd_img_1st - tile_gt_img) ** 2)
+        l2_loss_1st = l2_loss_func(tile_rd_img_1st, tile_gt_img)
         writer_1st.add_image(
             f"Render_{view_idx:04d}_{tile_x:04d}_{tile_y:0d}",
             tile_rd_img_1st[0],
@@ -317,7 +317,7 @@ def train():
         tile_means3d_2nd = tile_means3d_2nd + delta_means3d_2nd
 
         tile_rd_img_2nd = render_func(tile_means3d_2nd)[0]
-        l2_loss_2nd = torch.mean((tile_rd_img_2nd - tile_gt_img) ** 2)
+        l2_loss_2nd = l2_loss_func(tile_rd_img_2nd, tile_gt_img)
         LOGGER.info(
             f"View={view_idx}, Tile=({tile_x}, {tile_y}), #Splats={n_splats}, "
             + f"Step={i}, Jacobian={jacob_2nd_elapsed:.6f} seconds, "
