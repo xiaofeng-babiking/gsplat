@@ -7,10 +7,22 @@ from typing import Literal, Optional
 import numpy as np
 import torch
 import tyro
+from enum import Enum
 from PIL import Image
 from torch import Tensor, optim
-
+from torch.utils import tensorboard
+import torch.nn.functional as F
 from gsplat import rasterization, rasterization_2dgs
+
+
+class GSParameters(Enum):
+    POSITION = 0
+    ROTATION = 1  # orientations of each 3D gaussian ellipsoid
+    SCALE = 2
+    OPACITY = 3
+    COLOR = 4
+    VIEW = 5
+    CAMERA = 6
 
 
 class SimpleTrainer:
@@ -38,8 +50,8 @@ class SimpleTrainer:
 
         self.means = bd * (torch.rand(self.num_points, 3, device=self.device) - 0.5)
         self.scales = torch.rand(self.num_points, 3, device=self.device)
-        d = 3
-        self.rgbs = torch.rand(self.num_points, d, device=self.device)
+        d = (3 + 1) ** 2
+        self.rgbs = torch.rand(self.num_points, d, 3, device=self.device)
 
         u = torch.rand(self.num_points, 1, device=self.device)
         v = torch.rand(self.num_points, 1, device=self.device)
@@ -78,9 +90,17 @@ class SimpleTrainer:
         self,
         iterations: int = 1000,
         lr: float = 0.01,
-        save_imgs: bool = False,
+        save_imgs: bool = True,
         model_type: Literal["3dgs", "2dgs"] = "3dgs",
+        save_path: Optional[str] = os.path.join(
+            os.path.dirname(__file__), "image_fitting_1st_order"
+        ),
     ):
+        writer = tensorboard.SummaryWriter(
+            log_dir=os.path.join(save_path, "tensorboard")
+        )
+        writer.add_image("Groundtruth", self.gt_image, global_step=0, dataformats="HWC")
+
         optimizer = optim.Adam(
             [self.rgbs, self.means, self.scales, self.opacities, self.quats], lr
         )
@@ -109,11 +129,12 @@ class SimpleTrainer:
                 self.quats / self.quats.norm(dim=-1, keepdim=True),
                 self.scales,
                 torch.sigmoid(self.opacities),
-                torch.sigmoid(self.rgbs),
+                self.rgbs,
                 self.viewmat[None],
                 K[None],
                 self.W,
                 self.H,
+                sh_degree=3,
                 packed=False,
             )[0]
             out_img = renders[0]
@@ -127,16 +148,40 @@ class SimpleTrainer:
             times[1] += time.time() - start
             optimizer.step()
             print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
+            if iter % 300 == 0:
+                writer.add_image("Render", out_img, global_step=iter, dataformats="HWC")
+            writer.add_scalar("Loss", loss, global_step=iter)
 
-            if save_imgs and iter % 5 == 0:
+            if save_imgs and iter % 300 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
+
+            if iter % 1000 == 0 or iter == iterations - 1:
+                chkpt_file = os.path.join(
+                    save_path, "checkpoint", f"checkpoint_{iter:04d}.pth"
+                )
+                os.makedirs(os.path.dirname(chkpt_file), exist_ok=True)
+
+                torch.save(
+                    {
+                        "splats": {
+                            "means": self.means.clone(),
+                            "scales": torch.log(self.scales.clone()),
+                            "quats": self.quats.clone()
+                            / self.quats.clone().norm(dim=-1, keepdim=True),
+                            "sh0": self.rgbs.clone()[:, 0, :][:, None, :],
+                            "shN": self.rgbs.clone()[:, 1:, :][:, :, :],
+                            "opacities": self.opacities.clone(),
+                        }
+                    },
+                    chkpt_file,
+                )
+
         if save_imgs:
             # save them as a gif with PIL
             frames = [Image.fromarray(frame) for frame in frames]
-            out_dir = os.path.join(os.getcwd(), "results")
-            os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(save_path, exist_ok=True)
             frames[0].save(
-                f"{out_dir}/training.gif",
+                f"{save_path}/training.gif",
                 save_all=True,
                 append_images=frames[1:],
                 optimize=False,
@@ -162,9 +207,11 @@ def main(
     height: int = 256,
     width: int = 256,
     num_points: int = 100000,
-    save_imgs: bool = True,
-    img_path: Optional[Path] = None,
-    iterations: int = 1000,
+    save_imgs: bool = False,
+    img_path: Optional[
+        Path
+    ] = "/home/babiking/mnt/Datasets.writable-by-babiking/example/MooreThreads.png",
+    iterations: int = 10000,
     lr: float = 0.01,
     model_type: Literal["3dgs", "2dgs"] = "3dgs",
 ) -> None:
