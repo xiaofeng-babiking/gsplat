@@ -1,9 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
-from typing import Optional, Literal, Tuple
-import numpy as np
-from scipy.optimize import curve_fit
+from typing import Optional, Literal
 from torch.nn.modules.loss import _Loss
 
 EPS = 1e-12
@@ -277,16 +275,7 @@ def project_gaussians_3d_to_2d(
     # Dim = [mN, tK, 3] * [mN, tK, 1]
     conics2d = conics2d / (det[:, :, None] + EPS)
 
-    extend = (torch.ones_like(opacities) * 3.33) if opacities is not None else 3.33
-    if opacities is not None:
-        det_raw = (a - 0.3) * (d - 0.3) - b * c
-        compensate = torch.sqrt(torch.clamp(det_raw / (det + EPS), min=0.0))
-
-        opacities = opacities * compensate
-
-        extend = torch.minimum(
-            extend, torch.sqrt(2.0 * torch.log(opacities / alpha_threshold))
-        )
+    extend = 3.3
 
     radius_x = torch.ceil(extend * torch.sqrt(covars2d[..., 0, 0]))
     radius_y = torch.ceil(extend * torch.sqrt(covars2d[..., 1, 1]))
@@ -309,7 +298,7 @@ def project_gaussians_3d_to_2d(
     radius[~inside] = 0.0
 
     radii = radius.int()
-    return means2d, conics2d, depths, radii, opacities
+    return means2d, conics2d, depths, radii
 
 
 def combine_sh_colors_from_coefficients(
@@ -428,6 +417,19 @@ def combine_sh_colors_from_coefficients(
     return sh_colors
 
 
+def compute_sh_colors(
+    means3d: torch.FloatTensor,
+    view_mats: torch.FloatTensor,
+    sh_coeffs: torch.FloatTensor,
+):
+    """Combine spherical harmonic colors."""
+    view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
+    # Dim = [mN, tK, mC]
+    sh_colors = combine_sh_colors_from_coefficients(view_dirs, sh_coeffs)
+    sh_colors = torch.clamp_min(sh_colors + 0.5, 0.0)
+    return sh_colors
+
+
 def rasterize_to_pixels_tile_forward(
     tile_x: int,
     tile_y: int,
@@ -442,21 +444,20 @@ def rasterize_to_pixels_tile_forward(
     sh_coeffs: torch.FloatTensor,  # Dim = [tK, (L + 1)^2, 3]
     cam_mats: torch.FloatTensor,  # Dim = [mN, 3, 3]
     view_mats: torch.FloatTensor,  # Dim =[mN, 4, 4]
-    with_compensate: bool = False,
     masks: Optional[torch.FloatTensor] = None,
 ):
     """Torch tile-based rasterization implementation."""
     # Dim = [tK, 3, 3]
     covars3d = compute_covariance_3d(quats, scales)
 
-    means2d, conics2d, depths, radii, _ = project_gaussians_3d_to_2d(
+    means2d, conics2d, depths, radii = project_gaussians_3d_to_2d(
         view_mats,
         cam_mats,
         means3d,
         covars3d,
         img_w,
         img_h,
-        opacities=opacities if with_compensate else None,
+        opacities=None,
     )
 
     assert torch.all(
@@ -472,10 +473,7 @@ def rasterize_to_pixels_tile_forward(
         tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h, means2d, conics2d
     )
 
-    view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
-    # Dim = [mN, tK, mC]
-    sh_colors = combine_sh_colors_from_coefficients(view_dirs, sh_coeffs)
-    sh_colors = torch.clamp_min(sh_colors + 0.5, 0.0)
+    sh_colors = compute_sh_colors(means3d, view_mats, sh_coeffs)
 
     # Dim = [mN, tH, tW, tK]
     tile_alphas = tile_gausses2d * opacities
@@ -498,7 +496,8 @@ def rasterize_to_pixels_tile_forward(
     tile_rgb = tile_rgb.permute([0, 3, 1, 2])
 
     # Dim = [mN, tH, tW, 1]
-    tile_a = 1.0 - blend_alphas[:, :, :, -1, None]
+    tile_a = 1.0 - blend_alphas[:, :, :, -1][..., None]
+    tile_a = tile_a.permute([0, 3, 1, 2])
     return tile_rgb, tile_a, tile_bbox
 
 

@@ -79,13 +79,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -123,9 +123,6 @@ class Config:
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
-    # Use LBFGS i.e. second-order optimization.
-    second_order: bool = False
-    second_order_trainables: Optional[List[str]] = None
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
@@ -213,127 +210,92 @@ class Config:
 
 def create_splats_with_optimizers(
     parser: Parser,
-    init_type: str = "sfm",  # 初始化类型: "sfm"从解析器获取点云，"random"随机生成
-    init_num_pts: int = 100_000,  # 随机初始化时的点数
-    init_extent: float = 3.0,  # 随机初始化时的空间范围
-    init_opacity: float = 0.1,  # 初始不透明度
-    init_scale: float = 1.0,  # 初始高斯尺度缩放因子
-    means_lr: float = 1.6e-4,  # 均值(位置)学习率
-    scales_lr: float = 5e-3,  # 尺度学习率
-    opacities_lr: float = 5e-2,  # 不透明度学习率
-    quats_lr: float = 1e-3,  # 四元数(旋转)学习率
-    sh0_lr: float = 2.5e-3,  # 0阶球谐系数学习率
-    shN_lr: float = 2.5e-3 / 20,  # 高阶球谐系数学习率
-    scene_scale: float = 1.0,  # 场景缩放因子
-    sh_degree: int = 3,  # 球谐函数最高阶数
-    sparse_grad: bool = False,  # 是否使用稀疏梯度优化器
-    visible_adam: bool = False,  # 是否使用可见性感知的Adam优化器
-    batch_size: int = 1,  # 批量大小
-    feature_dim: Optional[int] = None,  # 特征维度(不使用球谐时)
-    device: str = "cuda",  # 计算设备
-    world_rank: int = 0,  # 分布式训练中的rank
-    world_size: int = 1,  # 分布式训练中的world size
-    restore_ckpt_file: Optional[str] = None,
-    trainables: Optional[List[str]] = None,
+    init_type: str = "sfm",
+    init_num_pts: int = 100_000,
+    init_extent: float = 3.0,
+    init_opacity: float = 0.1,
+    init_scale: float = 1.0,
+    means_lr: float = 1.6e-4,
+    scales_lr: float = 5e-3,
+    opacities_lr: float = 5e-2,
+    quats_lr: float = 1e-3,
+    sh0_lr: float = 2.5e-3,
+    shN_lr: float = 2.5e-3 / 20,
+    scene_scale: float = 1.0,
+    sh_degree: int = 3,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    batch_size: int = 1,
+    feature_dim: Optional[int] = None,
+    device: str = "cuda",
+    world_rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if restore_ckpt_file is None:
-        if init_type == "sfm":
-            points = torch.from_numpy(parser.points).float()  # 从解析器获取3D点坐标
-            rgbs = torch.from_numpy(
-                parser.points_rgb / 255.0
-            ).float()  # 获取RGB颜色并归一化
-        elif init_type == "random":
-            points = (
-                init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-            )  # 在立方体内随机生成点
-            rgbs = torch.rand((init_num_pts, 3))  # 随机生成颜色
-        else:
-            raise ValueError("Please specify a correct init_type: sfm or random")
-
-        # 计算每个点到3个最近邻的平均距离作为初始高斯尺度
-        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,] 计算平方距离均值
-        dist_avg = torch.sqrt(dist2_avg)  # 转换为实际距离
-        scales = (
-            torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)
-        )  # [N,3] 应用初始缩放并扩展到xyz三个维度
-
-        # 分布式训练: 将高斯点按rank均匀分配到不同进程
-        points = points[world_rank::world_size]  # 分配点坐标
-        rgbs = rgbs[world_rank::world_size]  # 分配颜色
-        scales = scales[world_rank::world_size]  # 分配尺度
-
-        N = points.shape[0]
-        quats = torch.rand((N, 4))  # [N, 4]
-        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
-        params = [  # 可优化参数列表: (参数名, 参数值, 学习率)
-            ("means", torch.nn.Parameter(points), means_lr * scene_scale),  # 位置参数
-            ("scales", torch.nn.Parameter(scales), scales_lr),  # 尺度参数
-            ("quats", torch.nn.Parameter(quats), quats_lr),  # 旋转参数
-            ("opacities", torch.nn.Parameter(opacities), opacities_lr),  # 不透明度参数
-        ]
-
-        if feature_dim is None:
-            # 使用球谐函数表示颜色
-            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N,K,3] 初始化球谐系数
-            colors[:, 0, :] = rgb_to_sh(rgbs)  # 0阶球谐系数来自RGB颜色
-            params.append(
-                ("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr)
-            )  # 0阶球谐参数
-            params.append(
-                ("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr)
-            )  # 高阶球谐参数
-        else:
-            # 使用特征向量表示外观和视角相关着色
-            features = torch.rand(N, feature_dim)  # [N,D] 随机初始化特征
-            params.append(
-                ("features", torch.nn.Parameter(features), sh0_lr)
-            )  # 外观特征参数
-            colors = torch.logit(rgbs)  # [N,3] 将RGB转换为logit空间
-            params.append(
-                ("colors", torch.nn.Parameter(colors), sh0_lr)
-            )  # 基础颜色参数
+    if init_type == "sfm":
+        points = torch.from_numpy(parser.points).float()
+        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+    elif init_type == "random":
+        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        rgbs = torch.rand((init_num_pts, 3))
     else:
-        ckpt = torch.load(restore_ckpt_file)["splats"]
-        param_key_to_lr = {
-            "means": means_lr * scene_scale,
-            "scales": scales_lr,
-            "quats": quats_lr,
-            "opacities": opacities_lr,
-            "sh0": sh0_lr,
-            "shN": shN_lr,
-        }
-        params = [
-            (k, torch.nn.Parameter(v), param_key_to_lr[k]) for k, v in ckpt.items()
-        ]
+        raise ValueError("Please specify a correct init_type: sfm or random")
 
-    for i in range(len(params)):
-        if trainables is not None and params[i][0] not in trainables:
-            params[i][1].requires_grad = False
+    # Initialize the GS size to be the average dist of the 3 nearest neighbors
+    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg)
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(
-        device
-    )  # 创建参数字典并移动到设备
+    # Distribute the GSs to different ranks (also works for single rank)
+    points = points[world_rank::world_size]
+    rgbs = rgbs[world_rank::world_size]
+    scales = scales[world_rank::world_size]
 
-    # 根据批量大小调整学习率(平方根缩放)
-    BS = batch_size * world_size  # 总批量大小(考虑分布式)
-    optimizer_class = None  # 选择优化器类型
+    N = points.shape[0]
+    quats = torch.rand((N, 4))  # [N, 4]
+    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
+    params = [
+        # name, value, lr
+        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+        ("scales", torch.nn.Parameter(scales), scales_lr),
+        ("quats", torch.nn.Parameter(quats), quats_lr),
+        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+    ]
+
+    if feature_dim is None:
+        # color is SH coefficients.
+        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+        colors[:, 0, :] = rgb_to_sh(rgbs)
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+    else:
+        # features will be used for appearance and view-dependent shading
+        features = torch.rand(N, feature_dim)  # [N, feature_dim]
+        params.append(("features", torch.nn.Parameter(features), sh0_lr))
+        colors = torch.logit(rgbs)  # [N, 3]
+        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+    # Scale learning rate based on batch size, reference:
+    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+    # Note that this would not make the training exactly equivalent, see
+    # https://arxiv.org/pdf/2402.18824v1
+    BS = batch_size * world_size
+    optimizer_class = None
     if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam  # 稀疏梯度优化器
+        optimizer_class = torch.optim.SparseAdam
     elif visible_adam:
-        optimizer_class = SelectiveAdam  # 可见性感知Adam
+        optimizer_class = SelectiveAdam
     else:
-        optimizer_class = torch.optim.Adam  # 标准Adam优化器
-
-    optimizers = {  # 为每个参数创建优化器
+        optimizer_class = torch.optim.Adam
+    optimizers = {
         name: optimizer_class(
-            [
-                {"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}
-            ],  # 调整后的学习率
-            eps=1e-15 / math.sqrt(BS),  # 调整epsilon防止数值不稳定
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),  # 调整动量参数
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            eps=1e-15 / math.sqrt(BS),
+            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
         )
-        for name, _, lr in params  # 遍历所有参数
+        for name, _, lr in params
     }
     return splats, optimizers
 
@@ -409,14 +371,11 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
-            restore_ckpt_file=cfg.ckpt[0],
-            trainables=cfg.second_order_trainables,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
-        if not cfg.second_order:
-            # Densification Strategy
-            self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+        # Densification Strategy
+        self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
         if isinstance(self.cfg.strategy, DefaultStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state(
@@ -493,18 +452,6 @@ class Runner:
                     eps=1e-15,
                 ),
             ]
-
-        self.sec_order_optimizers = {}
-        if cfg.second_order:
-            self.sec_order_optimizers = {
-                name: torch.optim.LBFGS(
-                    optimizer.param_groups,
-                    lr=1.0,
-                    history_size=100,
-                    max_iter=20,
-                )
-                for name, optimizer in self.optimizers.items()
-            }
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -595,122 +542,6 @@ class Runner:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
-    def forward(
-        self, data: Dict[str, torch.Tensor], step: int, skip_strategy: bool = False
-    ):
-        device = self.device
-        camtoworlds = data["camtoworld"].to(device)  # [1, 4, 4]
-        Ks = data["K"].to(device)  # [1, 3, 3]
-        pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-        image_ids = data["image_id"].to(device)
-        masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-
-        height, width = pixels.shape[1:3]
-
-        if cfg.pose_noise:
-            camtoworlds = self.pose_perturb(camtoworlds, image_ids)
-
-        if cfg.pose_opt:
-            camtoworlds = self.pose_adjust(camtoworlds, image_ids)
-
-        # sh schedule
-        sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
-        # forward
-        renders, alphas, info = self.rasterize_splats(
-            camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=width,
-            height=height,
-            sh_degree=sh_degree_to_use,
-            near_plane=cfg.near_plane,
-            far_plane=cfg.far_plane,
-            image_ids=image_ids,
-            render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-            masks=masks,
-        )
-        if renders.shape[-1] == 4:
-            colors, depths = renders[..., 0:3], renders[..., 3:4]
-        else:
-            colors, depths = renders, None
-
-        if cfg.use_bilateral_grid:
-            grid_y, grid_x = torch.meshgrid(
-                (torch.arange(height, device=self.device) + 0.5) / height,
-                (torch.arange(width, device=self.device) + 0.5) / width,
-                indexing="ij",
-            )
-            grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-            colors = slice(
-                self.bil_grids,
-                grid_xy.expand(colors.shape[0], -1, -1, -1),
-                colors,
-                image_ids.unsqueeze(-1),
-            )["rgb"]
-
-        if cfg.random_bkgd:
-            bkgd = torch.rand(1, 3, device=device)
-            colors = colors + bkgd * (1.0 - alphas)
-
-        if not skip_strategy:
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
-        return Ks, camtoworlds, colors, alphas, depths, info
-
-    def loss(
-        self,
-        colors: torch.Tensor,
-        pixels: torch.Tensor,
-        depths: torch.Tensor,
-        depths_gt: torch.Tensor,
-    ) -> torch.Tensor:
-        height, width = pixels.shape[1:3]
-
-        # loss
-        l1loss = F.l1_loss(colors, pixels)
-        ssimloss = 1.0 - fused_ssim(
-            colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-        )
-        loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-
-        depthloss = None
-        if cfg.depth_loss:
-            # query depths from depth map
-            points = torch.stack(
-                [
-                    points[:, :, 0] / (width - 1) * 2 - 1,
-                    points[:, :, 1] / (height - 1) * 2 - 1,
-                ],
-                dim=-1,
-            )  # normalize to [-1, 1]
-            grid = points.unsqueeze(2)  # [1, M, 1, 2]
-            depths = F.grid_sample(
-                depths.permute(0, 3, 1, 2), grid, align_corners=True
-            )  # [1, 1, M, 1]
-            depths = depths.squeeze(3).squeeze(1)  # [1, M]
-            # calculate loss in disparity space
-            disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-            disp_gt = 1.0 / depths_gt  # [1, M]
-            depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-            loss += depthloss * cfg.depth_lambda
-
-        tvloss = None
-        if cfg.use_bilateral_grid:
-            tvloss = 10 * total_variation_loss(self.bil_grids.grids)
-            loss += tvloss
-
-        # regularizations
-        if cfg.opacity_reg > 0.0:
-            loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-        if cfg.scale_reg > 0.0:
-            loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
-        return loss, l1loss, ssimloss, depthloss, tvloss
-
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -781,31 +612,109 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            camtoworlds_gt = data["camtoworld"].to(device)
+            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-
+            image_ids = data["image_id"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
-            else:
-                points, depths_gt = None, None
+
+            height, width = pixels.shape[1:3]
+
+            if cfg.pose_noise:
+                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+
+            if cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            Ks, camtoworlds, colors, alphas, depths, info = self.forward(
-                data, step, skip_strategy=cfg.second_order
+            # forward
+            renders, alphas, info = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=sh_degree_to_use,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=image_ids,
+                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                masks=masks,
             )
-            loss, l1loss, ssimloss, depthloss, tvloss = self.loss(
-                colors, pixels, depths, depths_gt
+            if renders.shape[-1] == 4:
+                colors, depths = renders[..., 0:3], renders[..., 3:4]
+            else:
+                colors, depths = renders, None
+
+            if cfg.use_bilateral_grid:
+                grid_y, grid_x = torch.meshgrid(
+                    (torch.arange(height, device=self.device) + 0.5) / height,
+                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    indexing="ij",
+                )
+                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                colors = slice(
+                    self.bil_grids,
+                    grid_xy.expand(colors.shape[0], -1, -1, -1),
+                    colors,
+                    image_ids.unsqueeze(-1),
+                )["rgb"]
+
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=device)
+                colors = colors + bkgd * (1.0 - alphas)
+
+            self.cfg.strategy.step_pre_backward(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=info,
             )
 
-            # Second-order optimization loss backward at each closure step
-            if not cfg.second_order:
-                loss.backward()
+            # loss
+            l1loss = F.l1_loss(colors, pixels)
+            ssimloss = 1.0 - fused_ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            )
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            if cfg.depth_loss:
+                # query depths from depth map
+                points = torch.stack(
+                    [
+                        points[:, :, 0] / (width - 1) * 2 - 1,
+                        points[:, :, 1] / (height - 1) * 2 - 1,
+                    ],
+                    dim=-1,
+                )  # normalize to [-1, 1]
+                grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                depths = F.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True
+                )  # [1, 1, M, 1]
+                depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                # calculate loss in disparity space
+                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                disp_gt = 1.0 / depths_gt  # [1, M]
+                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                loss += depthloss * cfg.depth_lambda
+            if cfg.use_bilateral_grid:
+                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                loss += tvloss
+
+            # regularizations
+            if cfg.opacity_reg > 0.0:
+                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+            if cfg.scale_reg > 0.0:
+                loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+
+            loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -856,19 +765,19 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                ckpt_data = {"step": step, "splats": self.splats.state_dict()}
+                data = {"step": step, "splats": self.splats.state_dict()}
                 if cfg.pose_opt:
                     if world_size > 1:
-                        ckpt_data["pose_adjust"] = self.pose_adjust.module.state_dict()
+                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
-                        ckpt_data["pose_adjust"] = self.pose_adjust.state_dict()
+                        data["pose_adjust"] = self.pose_adjust.state_dict()
                 if cfg.app_opt:
                     if world_size > 1:
-                        ckpt_data["app_module"] = self.app_module.module.state_dict()
+                        data["app_module"] = self.app_module.module.state_dict()
                     else:
-                        ckpt_data["app_module"] = self.app_module.state_dict()
+                        data["app_module"] = self.app_module.state_dict()
                 torch.save(
-                    ckpt_data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
@@ -931,33 +840,12 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
-            if cfg.second_order:
-                for optimizer in self.sec_order_optimizers.values():
-
-                    def closure():
-                        if torch.is_grad_enabled():
-                            optimizer.zero_grad(set_to_none=True)
-
-                        _, _, colors, _, depths, _ = self.forward(
-                            data, step, skip_strategy=True
-                        )
-                        loss = self.loss(colors, pixels, depths, depths_gt)[0]
-
-                        if loss.requires_grad:
-                            loss.backward()
-                        return loss
-
-                    optimizer.step(closure)
-                    optimizer.zero_grad(set_to_none=True)
-
-            else:
-                for optimizer in self.optimizers.values():
-                    if cfg.visible_adam:
-                        optimizer.step(visibility_mask)
-                    else:
-                        optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-
+            for optimizer in self.optimizers.values():
+                if cfg.visible_adam:
+                    optimizer.step(visibility_mask)
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -971,27 +859,26 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if not cfg.second_order:
-                if isinstance(self.cfg.strategy, DefaultStrategy):
-                    self.cfg.strategy.step_post_backward(
-                        params=self.splats,
-                        optimizers=self.optimizers,
-                        state=self.strategy_state,
-                        step=step,
-                        info=info,
-                        packed=cfg.packed,
-                    )
-                elif isinstance(self.cfg.strategy, MCMCStrategy):
-                    self.cfg.strategy.step_post_backward(
-                        params=self.splats,
-                        optimizers=self.optimizers,
-                        state=self.strategy_state,
-                        step=step,
-                        info=info,
-                        lr=schedulers[0].get_last_lr()[0],
-                    )
-                else:
-                    assert_never(self.cfg.strategy)
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                )
+            else:
+                assert_never(self.cfg.strategy)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1279,20 +1166,21 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    # if cfg.ckpt is not None:
-    #     # run eval only
-    #     ckpts = [
-    #         torch.load(file, map_location=runner.device, weights_only=True)
-    #         for file in cfg.ckpt
-    #     ]
-    #     for k in runner.splats.keys():
-    #         runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-    #     step = ckpts[0]["step"]
-    #     runner.eval(step=step)
-    #     runner.render_traj(step=step)
-    #     if cfg.compression is not None:
-    #         runner.run_compression(step=step)
-    runner.train()
+    if cfg.ckpt is not None:
+        # run eval only
+        ckpts = [
+            torch.load(file, map_location=runner.device, weights_only=True)
+            for file in cfg.ckpt
+        ]
+        for k in runner.splats.keys():
+            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        step = ckpts[0]["step"]
+        runner.eval(step=step)
+        runner.render_traj(step=step)
+        if cfg.compression is not None:
+            runner.run_compression(step=step)
+    else:
+        runner.train()
 
     if not cfg.disable_viewer:
         runner.viewer.complete()

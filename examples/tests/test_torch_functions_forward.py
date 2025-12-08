@@ -212,7 +212,7 @@ def test_rasterization_tile_forward():
         covars3d_fwd, covars3d_fwd.transpose(-1, -2)
     ), f"Covariance 3D NOT symmetric!"
 
-    means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd, _ = project_gaussians_3d_to_2d(
+    means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd = project_gaussians_3d_to_2d(
         view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h
     )
     assert torch.allclose(opacities, rd_meta["opacities"], atol=1e-4, rtol=1e-3)
