@@ -39,12 +39,14 @@ def project_points_3d_to_2d(
     return cam_pnts3d, img_pnts2d
 
 
-def get_tile_size(tile_x: int, tile_y: int, tile_size: int, img_w: int, img_h: int):
+def get_tile_size(
+    tile_x: int, tile_y: int, tile_size_w: int, tile_size_h: int, img_w: int, img_h: int
+):
     """Get valid tile size within image."""
-    tile_xmin = tile_x * tile_size
-    tile_ymin = tile_y * tile_size
-    tile_xmax = min(img_w, tile_xmin + tile_size)
-    tile_ymax = min(img_h, tile_ymin + tile_size)
+    tile_xmin = tile_x * tile_size_w
+    tile_ymin = tile_y * tile_size_h
+    tile_xmax = min(img_w, tile_xmin + tile_size_w)
+    tile_ymax = min(img_h, tile_ymin + tile_size_h)
 
     crop_w = tile_xmax - tile_xmin
     crop_h = tile_ymax - tile_ymin
@@ -89,7 +91,8 @@ def compute_covariance_3d(
 def compute_gaussian_weights_2d_tile(
     tile_x: int,
     tile_y: int,
-    tile_size: int,
+    tile_size_w: int,
+    tile_size_h: int,
     img_w: int,
     img_h: int,
     means2d: torch.FloatTensor,
@@ -100,8 +103,8 @@ def compute_gaussian_weights_2d_tile(
     Args:
         [1] tile_x: int.
         [2] tile_y: int.
-        [3] tile_w: int.
-        [4] tile_h: int.
+        [3] tile_size_w: int.
+        [4] tile_size_h: int.
         [5] img_w:  int.
         [6] img_h:  int.
         [7] means2d: Dim=[mN, tK, 2].
@@ -111,7 +114,7 @@ def compute_gaussian_weights_2d_tile(
         [1] gauss_weights: Dim = [mN, tH, tW, tK]
     """
     tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
-        tile_x, tile_y, tile_size, img_w, img_h
+        tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h
     )
 
     tile_ys, tile_xs = torch.meshgrid(
@@ -428,7 +431,8 @@ def combine_sh_colors_from_coefficients(
 def rasterize_to_pixels_tile_forward(
     tile_x: int,
     tile_y: int,
-    tile_size: int,
+    tile_size_w: int,
+    tile_size_h: int,
     img_w: int,
     img_h: int,
     means3d: torch.FloatTensor,  # Dim = [tK, 3]
@@ -465,7 +469,7 @@ def rasterize_to_pixels_tile_forward(
 
     # Dim = [mN, tH, tW, tK]
     tile_gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
-        tile_x, tile_y, tile_size, img_w, img_h, means2d, conics2d
+        tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h, means2d, conics2d
     )
 
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
