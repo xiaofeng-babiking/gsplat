@@ -1,7 +1,10 @@
 import math
 import torch
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Literal, Tuple
+import numpy as np
+from scipy.optimize import curve_fit
+from torch.nn.modules.loss import _Loss
 
 EPS = 1e-12
 
@@ -493,3 +496,136 @@ def rasterize_to_pixels_tile_forward(
     # Dim = [mN, tH, tW, 1]
     tile_a = 1.0 - blend_alphas[:, :, :, -1, None]
     return tile_rgb, tile_a, tile_bbox
+
+
+def compute_kernel_mean_2d(img: torch.FloatTensor, kernel: torch.FloatTensor):
+    """Compute 2D kernel-weighted mean of an image."""
+    c = img.shape[1]
+
+    mean = torch.conv2d(
+        img,
+        torch.tile(kernel, (c, 1, 1, 1)),
+        stride=1,
+        padding="same",
+        groups=c,
+    )
+    return mean
+
+
+def compute_kernel_covariance_2d(
+    img0: torch.FloatTensor,
+    mean_0: Optional[torch.FloatTensor] = None,
+    img1: Optional[torch.FloatTensor] = None,
+    mean_1: Optional[torch.FloatTensor] = None,
+    kernel: Optional[torch.FloatTensor] = None,
+):
+    """Compute covariance between two images."""
+    if img1 is not None:
+        assert (
+            img0.shape == img1.shape
+        ), "Source and target image must have the same shape!"
+
+    if mean_0 is None:
+        mean_0 = compute_kernel_mean_2d(img0, kernel)
+
+    if img1 is not None and mean_1 is None:
+        mean_1 = compute_kernel_mean_2d(img1, kernel)
+
+    # No need to compute target mean when targe image is None
+    mean_1 = None if img1 is None else mean_1
+
+    if mean_1 is not None:
+        assert mean_0.shape == mean_1.shape, "Mean tensors must have the same shape!"
+
+    covar = (
+        compute_kernel_mean_2d(img0 * img1 if img1 is not None else img0**2, kernel)
+    ) - (mean_0 * mean_1 if mean_1 is not None else mean_0**2)
+    return covar
+
+
+class GroupSSIMLoss(_Loss):
+    def __init__(
+        self,
+        kernel_size: int = 11,
+        sigma: float = 1.5,
+        c1: float = 0.01**2,
+        c2: float = 0.03**2,
+        padding: Literal["same", "valid"] = "valid",
+        kernel: Optional[torch.FloatTensor] = None,
+        size_average=None,
+        reduce=None,
+        reduction: Literal["mean", "sum", "none"] = "mean",
+        *args,
+        **kwargs,
+    ):
+        self._c1 = c1
+        self._c2 = c2
+        self._padding = padding
+        self._reduction = reduction
+        super().__init__(size_average, reduce, reduction, *args, **kwargs)
+
+        self._kernel_size = kernel_size
+        self._mu = kernel_size // 2
+        self._sigma = sigma
+
+        if kernel is not None:
+            self._kernel = kernel
+        else:
+            self._filter = (
+                1.0
+                / (torch.sqrt(2 * torch.pi * sigma**2))
+                * torch.exp(
+                    -((torch.arange(self._kernel_size) - self._mu) ** 2)
+                    / (2 * self._sigma**2)
+                )
+            )
+            self._kernel = torch.outer(self._filter, self._filter)[None, None, ...]
+
+        self._kernel = torch.nn.Parameter(self._kernel, requires_grad=False)
+
+    def __str__(self):
+        """Return string representation of SSIM kernel."""
+        return (
+            "SSIMLoss with Gaussian kernel "
+            + f"size={self._kernel_size}, mean={self._kernel_size // 2}, variance={self._sigma:.6f}."
+        )
+
+    def forward(
+        self, input: torch.FloatTensor, target: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        """Compute SSIM loss between source and target image."""
+
+        assert (
+            input.shape == target.shape
+        ), "source and target image must have the same shape!"
+
+        src_mean = compute_kernel_mean_2d(input, kernel=self._kernel)
+        dst_mean = compute_kernel_mean_2d(target, kernel=self._kernel)
+
+        src_var = compute_kernel_covariance_2d(input, src_mean, kernel=self._kernel)
+        dst_var = compute_kernel_covariance_2d(target, dst_mean, kernel=self._kernel)
+        src_dst_covar = compute_kernel_covariance_2d(
+            input, src_mean, target, dst_mean, kernel=self._kernel
+        )
+
+        f0 = self._c1 + 2.0 * src_mean * dst_mean
+        f1 = self._c2 + 2.0 * src_dst_covar
+        f2 = self._c1 + src_mean**2 + dst_mean**2
+        f3 = self._c2 + src_var + dst_var
+        ssim_map = (f0 * f1) / (f2 * f3)
+
+        half_ksize = self._kernel_size // 2
+        if self._padding == "valid":
+            ssim_map = ssim_map[:, :, half_ksize:-half_ksize, half_ksize:-half_ksize]
+
+        if self._reduction == "mean":
+            ssim_score = torch.mean(ssim_map, dim=[1, 2, 3])
+        elif self._reduction == "sum":
+            ssim_score = torch.sum(ssim_map, dim=[1, 2, 3])
+        elif self._reduction == "none":
+            ssim_score = ssim_map
+        else:
+            raise ValueError(f"Invalid reduction mode: {self._reduction}!")
+
+        ssim_loss = 1.0 - ssim_score
+        return ssim_loss
