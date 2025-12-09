@@ -277,6 +277,8 @@ def test_rasterization_tile_forward():
                 view_mat,
             )
 
+            tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
+
             end = time.time()
             tile_elapsed = float(end - start)
 
