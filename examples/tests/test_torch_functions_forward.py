@@ -213,7 +213,7 @@ def test_rasterization_tile_forward():
     ), f"Covariance 3D NOT symmetric!"
 
     means2d_fwd, conics2d_fwd, depths_fwd, radii_fwd = project_gaussians_3d_to_2d(
-        view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h
+        view_mat, cam_mat, means3d, covars3d_fwd, img_w, img_h, opacities=opacities
     )
     assert torch.allclose(opacities, rd_meta["opacities"], atol=1e-4, rtol=1e-3)
 
@@ -235,9 +235,9 @@ def test_rasterization_tile_forward():
     radii_meta = rd_meta["radii"]
     radii_fwd_mask = (radii_fwd[0] > 0).all(dim=-1)
     radii_meta_mask = (radii_meta > 0).all(dim=-1)
-    ratio = (radii_fwd_mask == radii_meta_mask).int().sum() / radii_meta_mask.numel()
-    # TODO: align radii outputs with rendering metainformation
-    assert ratio > 0.999, f"Radius int failed!"
+    assert (
+        radii_fwd_mask == radii_meta_mask
+    ).float().sum() / radii_meta_mask.numel() >= 0.999
 
     # 3. test whole image rendering
     ssimer = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
@@ -306,5 +306,187 @@ def test_rasterization_tile_forward():
     assert ssim > 0.99, f"View=({view_idx}) render failed!"
 
 
+def test_rasterization_tile_backward():
+    "Test rasterization tile backward."
+    data, splats = generate_render_data_sample(batch_mode=False)
+
+    gt_imgs = data.groundtruth_image.contiguous()
+    rd_imgs = data.render_image.contiguous()
+    rd_metas = data.render_metadata
+    cam_mats = data.camera_matrix.contiguous()
+    view_mats = data.view_matrix.contiguous()
+
+    view_idx = random.choice(list(range(cam_mats.shape[0])))
+
+    gt_img = gt_imgs[view_idx, :, :, :][None]
+    rd_img = rd_imgs[view_idx, :, :, :][None]
+    cam_mat = cam_mats[view_idx, :, :][None]
+    view_mat = view_mats[view_idx, :, :][None]
+    rd_meta = rd_metas[view_idx]
+    img_w = rd_meta["width"]
+    img_h = rd_meta["height"]
+    tile_size = rd_meta["tile_size"]
+    tile_w = int(math.ceil(img_w / tile_size))
+    assert tile_w * tile_size >= img_w
+    tile_h = int(math.ceil(img_h / tile_size))
+    assert tile_h * tile_size >= img_h
+    isect_offsets = rd_meta["isect_offsets"]
+    assert isect_offsets.shape == (1, tile_h, tile_w)
+    flatten_ids = rd_meta["flatten_ids"]
+
+    device = rd_img.device
+
+    gauss_ids = rd_meta["gaussian_ids"]
+    LOGGER.info(
+        f"Random select View-{view_idx}, Tile={tile_w}x{tile_h}, #Splats={len(gauss_ids)}."
+    )
+
+    means3d = splats["means"][gauss_ids].contiguous()
+    scales = torch.exp(splats["scales"][gauss_ids]).contiguous()
+    opacities = torch.sigmoid(splats["opacities"][gauss_ids]).contiguous()
+    assert torch.allclose(opacities, rd_meta["opacities"], rtol=1e-3, atol=1e-3)
+    quats = splats["quats"][gauss_ids].contiguous()
+    sh_coeffs = torch.cat(
+        [splats["sh0"][gauss_ids], splats["shN"][gauss_ids]], dim=1
+    ).contiguous()
+    depths = rd_meta["depths"].contiguous()
+
+    sh_deg = int(np.sqrt(sh_coeffs.shape[-2])) - 1
+
+    params = torch.nn.ParameterDict(
+        {
+            "means3d": means3d,
+            "quaternions": quats,
+            "scales": scales,
+            "opacities": opacities,
+            "colors": sh_coeffs,
+        }
+    )
+
+    loss_fn = torch.nn.MSELoss()
+    ssim_fn = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
+    isect_offsets = isect_offsets.flatten()
+    for tile_idx in random.sample(
+        list(range(tile_h * tile_w)), k=int(tile_h * tile_w * 0.1)
+    ):
+        tile_y = tile_idx // tile_w
+        tile_x = tile_idx % tile_w
+
+        isect_start = isect_offsets[tile_idx]
+        isect_end = (
+            isect_offsets[tile_idx + 1]
+            if tile_idx < tile_h * tile_w - 1
+            else len(flatten_ids)
+        )
+
+        if isect_start >= isect_end:
+            continue
+
+        flat_idxs = flatten_ids[isect_start:isect_end]
+
+        tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
+            tile_x, tile_y, tile_size, tile_size, img_w, img_h
+        )
+
+        if crop_w < 5 or crop_h < 5:
+            continue
+
+        assert torch.all(depths[flat_idxs][1:] >= depths[flat_idxs][:-1])
+
+        tile_rd_img_cuda, _, _ = rasterization(
+            means=params["means3d"][flat_idxs],
+            quats=params["quaternions"][flat_idxs],
+            scales=params["scales"][flat_idxs],
+            opacities=params["opacities"][flat_idxs],
+            colors=params["colors"][flat_idxs],
+            Ks=cam_mat,
+            viewmats=view_mat,
+            width=img_w,
+            height=img_h,
+            sh_degree=sh_deg,
+            packed=True,
+        )
+
+        tile_rd_img_cuda = tile_rd_img_cuda.permute([0, 3, 1, 2])
+        tile_rd_img_cuda = tile_rd_img_cuda[
+            :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
+        ]
+        tile_gt_img = gt_img[
+            :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
+        ]
+        loss = loss_fn(tile_rd_img_cuda, tile_gt_img)
+        loss.backward()
+        jacob_cuda = {}
+        for group in params.keys():
+            jacob_cuda[group] = params[group].grad[flat_idxs].clone().detach()
+            params[group].grad = None
+        ssim_cuda = ssim_fn(
+            torch.clamp(tile_rd_img_cuda, min=0.0, max=1.0),
+            rd_img[
+                :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
+            ],
+        )
+        assert ssim_cuda >= 0.9999
+
+        tile_rd_img_torch, _, _ = rasterize_to_pixels_tile_forward(
+            tile_x,
+            tile_y,
+            tile_size,
+            tile_size,
+            img_w,
+            img_h,
+            means3d[flat_idxs].clone().detach(),
+            quats[flat_idxs].clone().detach(),
+            scales[flat_idxs].clone().detach(),
+            opacities[flat_idxs].clone().detach(),
+            sh_coeffs[flat_idxs].clone().detach(),
+            cam_mat.clone().detach(),
+            view_mat.clone().detach(),
+        )
+        ssim_torch = ssim_fn(
+            torch.clamp(tile_rd_img_torch, min=0.0, max=1.0),
+            rd_img[
+                :, :, tile_ymin : tile_ymin + crop_h, tile_xmin : tile_xmin + crop_w
+            ],
+        )
+        assert ssim_torch >= 0.9800
+
+        jacob_auto = {}
+        for group in params.keys():
+            render_fn = lambda x: rasterize_to_pixels_tile_forward(
+                tile_x,
+                tile_y,
+                tile_size,
+                tile_size,
+                img_w,
+                img_h,
+                x if group == "means3d" else means3d[flat_idxs].clone().detach(),
+                x if group == "quaternions" else quats[flat_idxs].clone().detach(),
+                x if group == "scales" else scales[flat_idxs].clone().detach(),
+                x if group == "opacities" else opacities[flat_idxs].clone().detach(),
+                x if group == "colors" else sh_coeffs[flat_idxs].clone().detach(),
+                cam_mat.clone().detach(),
+                view_mat.clone().detach(),
+            )
+
+            forward_fn = lambda x: loss_fn(render_fn(x)[0], tile_gt_img)
+
+            jacob_auto[group] = torch.autograd.functional.jacobian(
+                forward_fn, params[group][flat_idxs].clone().detach()
+            )
+
+        for group in params.keys():
+            # NOTE. autograd can NOT align jacobian scale with cuda kernel
+            torch.all(
+                torch.sign(jacob_cuda[group]) == torch.sign(jacob_auto[group]),
+            )
+
+        LOGGER.info(
+            f"Tile=({tile_x}, {tile_y}), SSIM(cuda)={ssim_cuda:.4f}, SSIM(torch)={ssim_torch:.4f}, Jacobian[Sign] aligned."
+        )
+
+
 if __name__ == "__main__":
+    test_rasterization_tile_backward()
     test_rasterization_tile_forward()

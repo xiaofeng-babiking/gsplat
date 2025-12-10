@@ -276,6 +276,13 @@ def project_gaussians_3d_to_2d(
     conics2d = conics2d / (det[:, :, None] + EPS)
 
     extend = 3.3
+    if opacities is not None:
+        extend = extend * torch.ones_like(opacities)
+
+        # Dim = [1, tK]
+        extend = torch.minimum(
+            extend, torch.sqrt(2.0 * torch.log(opacities / alpha_threshold))
+        )[None]
 
     radius_x = torch.ceil(extend * torch.sqrt(covars2d[..., 0, 0]))
     radius_y = torch.ceil(extend * torch.sqrt(covars2d[..., 1, 1]))
@@ -286,7 +293,7 @@ def project_gaussians_3d_to_2d(
     radius[~valid] = 0.0
 
     if opacities is not None:
-        valid = opacities >= alpha_threshold
+        valid = opacities.reshape([1, -1]) >= alpha_threshold
         radius[~valid, :] = 0.0
 
     inside = (
@@ -457,7 +464,7 @@ def rasterize_to_pixels_tile_forward(
         covars3d,
         img_w,
         img_h,
-        opacities=None,
+        opacities=opacities,
     )
 
     assert torch.all(
