@@ -47,6 +47,7 @@ gflags.DEFINE_string(
 )
 gflags.DEFINE_float("learn_rate", 0.01, "Learning rate.")
 gflags.DEFINE_float("sample_ratio", 1.0, "Sample ratio for multiple tiles.")
+gflags.DEFINE_integer("min_splats_per_tile", 20, "Minimum number of splats per tile.")
 gflags.DEFINE_string(
     "output",
     "/home/babiking/mnt/Codebases.writable-by-babiking/gsplat/examples/image_fit_2nd_order",
@@ -187,6 +188,7 @@ class SimpleTrainer:
         solver_level: SolverLevel = SolverLevel.IMAGE,
         solver_type: SolverType = SolverType.ADAM,
         sample_ratio: float = 1.0,
+        min_splats_per_tile: int = 20,
     ):
         """Train."""
         os.makedirs(out_path, exist_ok=True)
@@ -194,7 +196,7 @@ class SimpleTrainer:
             log_dir=os.path.join(out_path, f"{solver_level.name}-{solver_type.name}")
         )
 
-        n_splats = self._means3d.shape[0]
+        num_splats = self._means3d.shape[0]
         device = self._means3d.device
 
         optimizers = (
@@ -261,7 +263,7 @@ class SimpleTrainer:
                     [
                         optimizers[group.name].step(
                             visibility=torch.ones(
-                                [n_splats], dtype=torch.bool, device=device
+                                [num_splats], dtype=torch.bool, device=device
                             )
                         )
                         for group in groups
@@ -284,6 +286,8 @@ class SimpleTrainer:
 
                 flatten_ids = rd_meta["flatten_ids"]
 
+                tile_cnt = 0
+                avg_splats_per_tile = 0
                 for tile_idx in tqdm(
                     tile_idxs, desc=f"loop over step={i:04d} tiles..."
                 ):
@@ -297,8 +301,13 @@ class SimpleTrainer:
                         else len(flatten_ids)
                     )
 
-                    if isect_start >= isect_end:
+                    num_splats_per_tile = isect_end - isect_start
+
+                    if num_splats_per_tile <= max(min_splats_per_tile, 0):
                         continue
+
+                    tile_cnt += 1
+                    avg_splats_per_tile += num_splats_per_tile
 
                     flat_idxs = flatten_ids[isect_start:isect_end]
 
@@ -341,7 +350,7 @@ class SimpleTrainer:
                     ]
 
                     visibles = torch.zeros(
-                        size=[n_splats], dtype=torch.bool, device=device
+                        size=[num_splats], dtype=torch.bool, device=device
                     )
                     visibles[flat_idxs] = True
 
@@ -362,6 +371,15 @@ class SimpleTrainer:
                     optimizers[group.name].state[self._params[group.name]][
                         "step"
                     ] += 1.0
+
+                avg_splats_per_tile = float(avg_splats_per_tile) / tile_cnt
+                LOGGER.info(
+                    f"Step={i}, #Tiles={tile_cnt}, #SplatsPerTile={avg_splats_per_tile:.4f}."
+                )
+                writer.add_scalar("NumberOfTiles", tile_cnt, global_step=i)
+                writer.add_scalar(
+                    "AverageSplatsPerTile", avg_splats_per_tile, global_step=i
+                )
 
             elif solver_level == SolverLevel.RAY:
                 raise NotImplementedError(
@@ -458,9 +476,11 @@ def main():
     solver_level = SolverLevel[FLAGS.solver_level.upper()]
     init_lr = FLAGS.learn_rate
     sample_ratio = FLAGS.sample_ratio
+    min_splats_per_tile = FLAGS.min_splats_per_tile
     LOGGER.info(f"File={img_file}.")
     LOGGER.info(
-        f"Image={img_w}x{img_h}, #Splats={num_pnts}, FOV={fov_x:.2f}°, Degree={sh_deg}."
+        f"Image={img_w}x{img_h}, #Splats={num_pnts}, #SplatsPerTile={min_splats_per_tile}, "
+        + f"FOV={fov_x:.2f}°, Degree={sh_deg}."
     )
     LOGGER.info(
         f"SolverLevel={solver_level}, SolverType={solver_type}, "
@@ -479,6 +499,7 @@ def main():
         solver_level=solver_level,
         solver_type=solver_type,
         sample_ratio=sample_ratio,
+        min_splats_per_tile=min_splats_per_tile,
     )
 
 
