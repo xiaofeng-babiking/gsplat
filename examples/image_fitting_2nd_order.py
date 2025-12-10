@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import time
+import random
 import numpy as np
 from enum import Enum
 from typing import List, Optional
@@ -9,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils import tensorboard
 from PIL import Image
-from fused_ssim import fused_ssim
+from tqdm import tqdm
 from gsplat.rendering import rasterization
 from gsplat.optimizers.torch_functions_forward import (
     rasterize_to_pixels_tile_forward,
@@ -34,6 +35,18 @@ gflags.DEFINE_integer("width", 256, "Cropped image width.")
 gflags.DEFINE_integer("height", 256, "Cropped image height.")
 gflags.DEFINE_float("fov_x", 90.0, "FOV along X-axis in degrees.")
 gflags.DEFINE_integer("steps", 9000, "Number of training iterations.")
+gflags.DEFINE_string(
+    "solver_type",
+    "ADAM",
+    "Solver type, 1st or 2nd order optimizer, Literal['ADAM', 'NEWTON'].",
+)
+gflags.DEFINE_string(
+    "solver_level",
+    "IMAGE",
+    "Solver level, paramerater update granularity, Literal['IMAGE', 'TILE', 'PIXEL', 'RAY']",
+)
+gflags.DEFINE_float("learn_rate", 0.01, "Learning rate.")
+gflags.DEFINE_float("sample_ratio", 1.0, "Sample ratio for multiple tiles.")
 gflags.DEFINE_string(
     "output",
     "/home/babiking/mnt/Codebases.writable-by-babiking/gsplat/examples/image_fit_2nd_order",
@@ -173,6 +186,7 @@ class SimpleTrainer:
         ],
         solver_level: SolverLevel = SolverLevel.IMAGE,
         solver_type: SolverType = SolverType.ADAM,
+        sample_ratio: float = 1.0,
     ):
         """Train."""
         os.makedirs(out_path, exist_ok=True)
@@ -252,83 +266,107 @@ class SimpleTrainer:
                         )
                         for group in groups
                     ]
-                continue
+                else:
+                    raise NotImplementedError(
+                        f"NOT support solver={solver_type} (ADAM only) for level={solver_level}!"
+                    )
+            elif solver_level == SolverLevel.TILE or solver_level == SolverLevel.PIXEL:
+                tile_w = rd_meta["tile_width"]
+                tile_h = rd_meta["tile_height"]
 
-            # tile_w = rd_meta["tile_width"]
-            # tile_h = rd_meta["tile_height"]
-            # assert rd_meta["tile_size"] == tile_size
-            # assert rd_meta["width"] == self._img_w
-            # assert rd_meta["height"] == self._img_h
+                n_tiles = tile_h * tile_w
+                tile_idxs = random.sample(
+                    list(range(n_tiles)), k=int(n_tiles * sample_ratio)
+                )
 
-            # isect_offsets = rd_meta["isect_offsets"]
-            # isect_offsets = isect_offsets[0].flatten()
+                isect_offsets = rd_meta["isect_offsets"]
+                isect_offsets = isect_offsets[0].flatten()
 
-            # flatten_ids = rd_meta["flatten_ids"]
+                flatten_ids = rd_meta["flatten_ids"]
 
-            # tile_cnt = 0
+                for tile_idx in tqdm(
+                    tile_idxs, desc=f"loop over step={i:04d} tiles..."
+                ):
+                    tile_y = tile_idx // tile_w
+                    tile_x = tile_idx % tile_w
 
-            # jacob_elapsed = 0.0
-            # for group in groups:
-            #     for tile_idx in range(tile_h * tile_w):
-            #         tile_y = tile_idx // tile_w
-            #         tile_x = tile_idx % tile_w
+                    isect_start = isect_offsets[tile_idx]
+                    isect_end = (
+                        isect_offsets[tile_idx + 1]
+                        if tile_idx < tile_h * tile_w - 1
+                        else len(flatten_ids)
+                    )
 
-            #         isect_start = isect_offsets[tile_idx]
-            #         isect_end = (
-            #             isect_offsets[tile_idx + 1]
-            #             if tile_idx < tile_h * tile_w - 1
-            #             else len(flatten_ids)
-            #         )
+                    if isect_start >= isect_end:
+                        continue
 
-            #         if isect_start >= isect_end:
-            #             continue
+                    flat_idxs = flatten_ids[isect_start:isect_end]
 
-            #         tile_cnt += 1
+                    tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
+                        tile_x, tile_y, tile_size, tile_size, self._img_w, self._img_h
+                    )
 
-            #         flat_idxs = flatten_ids[isect_start:isect_end]
+                    tile_gt_img = self._gt_img[
+                        :,
+                        :,
+                        tile_ymin : tile_ymin + crop_h,
+                        tile_xmin : tile_xmin + crop_w,
+                    ]
 
-            #         tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
-            #             tile_x, tile_y, tile_size, tile_size, self._img_w, self._img_h
-            #         )
+                    tile_rd_img, _, rd_meta = rasterization(
+                        means=self._params[GSParameters.POSITION.name][flat_idxs],
+                        quats=self._params[GSParameters.ROTATION.name][flat_idxs]
+                        / self._params[GSParameters.ROTATION.name][flat_idxs].norm(
+                            dim=-1, keepdim=True
+                        ),
+                        scales=self._params[GSParameters.SCALE.name][flat_idxs],
+                        opacities=torch.sigmoid(
+                            self._params[GSParameters.OPACITY.name][flat_idxs]
+                        ),
+                        colors=self._params[GSParameters.COLOR.name][flat_idxs],
+                        viewmats=self._params[GSParameters.VIEW.name],
+                        Ks=self._params[GSParameters.CAMERA.name],
+                        width=self._img_w,
+                        height=self._img_h,
+                        sh_degree=self._sh_deg,
+                        tile_size=tile_size,
+                        packed=True,
+                    )
+                    tile_rd_img = tile_rd_img.permute([0, 3, 1, 2])
+                    tile_rd_img = tile_rd_img[
+                        :,
+                        :,
+                        tile_ymin : tile_ymin + crop_h,
+                        tile_xmin : tile_xmin + crop_w,
+                    ]
 
-            #         tile_gt_img = self._gt_img[
-            #             :,
-            #             :,
-            #             tile_ymin : tile_ymin + crop_h,
-            #             tile_xmin : tile_xmin + crop_w,
-            #         ]
+                    visibles = torch.zeros(
+                        size=[n_splats], dtype=torch.bool, device=device
+                    )
+                    visibles[flat_idxs] = True
 
-            #         rd_img, _, rd_meta = rasterization(
-            #             means=self._params[GSParameters.POSITION.name][flat_idxs],
-            #             quats=self._params[GSParameters.ROTATION.name][flat_idxs]
-            #             / self._params[GSParameters.ROTATION.name][flat_idxs].norm(
-            #                 dim=-1, keepdim=True
-            #             ),
-            #             scales=self._params[GSParameters.SCALE.name][flat_idxs],
-            #             opacities=torch.sigmoid(
-            #                 self._params[GSParameters.OPACITY.name][flat_idxs]
-            #             ),
-            #             colors=self._params[GSParameters.COLOR.name][flat_idxs],
-            #             viewmats=self._params[GSParameters.VIEW.name],
-            #             Ks=self._params[GSParameters.CAMERA.name],
-            #             width=self._img_w,
-            #             height=self._img_h,
-            #             sh_degree=self._sh_deg,
-            #             tile_size=tile_size,
-            #             packed=True,
-            #         )
-            #         rd_img = rd_img.permute([0, 3, 1, 2])
-            #         tile_rd_img = rd_img[
-            #             :,
-            #             :,
-            #             tile_ymin : tile_ymin + crop_h,
-            #             tile_xmin : tile_xmin + crop_w,
-            #         ]
-            #         loss = self._loss_fn(tile_rd_img, tile_gt_img)
-            #         loss.backward()
+                    if solver_type == SolverType.ADAM:
+                        tile_loss = self._loss_fn(tile_rd_img, tile_gt_img)
+                        for group in groups:
+                            optimizers[group.name].zero_grad()
+                        tile_loss.backward()
 
-            #         jacob_cuda = self._params[group.name].grad[flat_idxs]
-            #         self._params[group.name].grad = None
+                        for group in groups:
+                            optimizers[group.name].step(visibility=visibles)
+                            optimizers[group.name].state[self._params[group.name]][
+                                "step"
+                            ] -= 1.0
+
+                # NOTE. step only increase for each iteration, NOT each tile
+                for group in groups:
+                    optimizers[group.name].state[self._params[group.name]][
+                        "step"
+                    ] += 1.0
+
+            elif solver_level == SolverLevel.RAY:
+                raise NotImplementedError(
+                    f"Extra depth prior required for level={solver_level}!"
+                )
 
             #         render_fn = lambda x: rasterize_to_pixels_tile_forward(
             #             tile_x,
@@ -370,22 +408,6 @@ class SimpleTrainer:
             #             self._params[GSParameters.CAMERA.name],
             #             self._params[GSParameters.VIEW.name],
             #         )
-
-            #         forward_fn = lambda x: self._loss_fn(render_fn(x)[0], tile_gt_img)
-
-            #         start = time.time()
-            #         jacob_auto = torch.autograd.functional.jacobian(
-            #             forward_fn,
-            #             self._params[group.name][flat_idxs],
-            #         )
-            #         jacob_x = jacob_auto / (jacob_cuda + 1e-12)
-            #         end = time.time()
-            #         jacob_elapsed += float(end - start)
-
-            # LOGGER.info(
-            #     f"Step={i}, #Splats={len(self._params[GSParameters.POSITION])}, "
-            #     + f"#Tiles={tile_cnt}, JacobianPerTile={jacob_elapsed / tile_cnt:.6f}."
-            # )
 
         writer.close()
 
@@ -432,13 +454,32 @@ def main():
     num_pnts = FLAGS.points
     fov_x = FLAGS.fov_x
     sh_deg = FLAGS.degree
+    solver_type = SolverType[FLAGS.solver_type.upper()]
+    solver_level = SolverLevel[FLAGS.solver_level.upper()]
+    init_lr = FLAGS.learn_rate
+    sample_ratio = FLAGS.sample_ratio
+    LOGGER.info(f"File={img_file}.")
+    LOGGER.info(
+        f"Image={img_w}x{img_h}, #Splats={num_pnts}, FOV={fov_x:.2f}°, Degree={sh_deg}."
+    )
+    LOGGER.info(
+        f"SolverLevel={solver_level}, SolverType={solver_type}, "
+        + f"LearnRate={init_lr:.4f}, SampleRatio={sample_ratio:.4f}."
+    )
 
     gt_img = read_image_file(img_file, img_w, img_h)
 
     trainer = SimpleTrainer(
         gt_img=gt_img, num_pnts=num_pnts, fov_x=fov_x, sh_deg=sh_deg
     )
-    trainer.train(steps=FLAGS.steps, out_path=FLAGS.output)
+    trainer.train(
+        steps=FLAGS.steps,
+        out_path=FLAGS.output,
+        init_lr=init_lr,
+        solver_level=solver_level,
+        solver_type=solver_type,
+        sample_ratio=sample_ratio,
+    )
 
 
 if __name__ == "__main__":
