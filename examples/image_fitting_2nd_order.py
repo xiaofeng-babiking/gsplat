@@ -7,7 +7,6 @@ import numpy as np
 from enum import Enum
 from typing import List, Optional
 import torch
-import torch.nn.functional as F
 from torch.utils import tensorboard
 from PIL import Image
 from tqdm import tqdm
@@ -16,7 +15,7 @@ from gsplat.optimizers.torch_functions_forward import (
     rasterize_to_pixels_tile_forward,
     get_tile_size,
 )
-from gsplat.optimizers.selective_adam import SelectiveAdam
+from gsplat.optimizers.position_adam import PositionAdam
 from gsplat.logger import create_logger
 
 LOGGER = create_logger(name=os.path.basename(__file__), level="INFO")
@@ -42,7 +41,7 @@ gflags.DEFINE_string(
 )
 gflags.DEFINE_string(
     "solver_level",
-    "IMAGE",
+    "TILE",
     "Solver level, paramerater update granularity, Literal['IMAGE', 'TILE', 'PIXEL', 'RAY']",
 )
 gflags.DEFINE_float("learn_rate", 0.01, "Learning rate.")
@@ -193,8 +192,13 @@ class SimpleTrainer:
         """Train."""
         os.makedirs(out_path, exist_ok=True)
         writer = tensorboard.SummaryWriter(
-            log_dir=os.path.join(out_path, f"{solver_level.name}-{solver_type.name}")
+            log_dir=os.path.join(
+                out_path, "tensorboard", f"{solver_level.name}-{solver_type.name}"
+            )
         )
+
+        if solver_type == SolverType.NEWTON:
+            [self._params[group.name].requires_grad_(False) for group in groups]
 
         num_splats = self._means3d.shape[0]
         device = self._means3d.device
@@ -202,7 +206,7 @@ class SimpleTrainer:
         optimizers = (
             {
                 group.name: (
-                    SelectiveAdam(
+                    PositionAdam(
                         params=[
                             {
                                 "params": self._params[group.name],
@@ -263,7 +267,7 @@ class SimpleTrainer:
                     [
                         optimizers[group.name].step(
                             visibility=torch.ones(
-                                [num_splats], dtype=torch.bool, device=device
+                                size=[num_splats], dtype=torch.bool, device=device
                             )
                         )
                         for group in groups
@@ -287,7 +291,9 @@ class SimpleTrainer:
                 flatten_ids = rd_meta["flatten_ids"]
 
                 tile_cnt = 0
-                avg_splats_per_tile = 0
+                avg_splats_per_tile = 0.0
+                avg_jacob_elapsed = 0.0
+                avg_hess_elapsed = 0.0
                 for tile_idx in tqdm(
                     tile_idxs, desc=f"loop over step={i:04d} tiles..."
                 ):
@@ -358,74 +364,145 @@ class SimpleTrainer:
                         tile_loss = self._loss_fn(tile_rd_img, tile_gt_img)
                         for group in groups:
                             optimizers[group.name].zero_grad()
+                        start = time.time()
                         tile_loss.backward()
+                        end = time.time()
+                        avg_jacob_elapsed += float(end - start)
 
                         for group in groups:
                             optimizers[group.name].step(visibility=visibles)
                             optimizers[group.name].state[self._params[group.name]][
                                 "step"
                             ] -= 1.0
+                    elif solver_type == SolverType.NEWTON:
+                        for group in groups:
+                            render_fn = lambda x: rasterize_to_pixels_tile_forward(
+                                tile_x,
+                                tile_y,
+                                tile_size,
+                                tile_size,
+                                self._img_w,
+                                self._img_h,
+                                (
+                                    x
+                                    if group == GSParameters.POSITION
+                                    else self._params[GSParameters.POSITION.name][
+                                        flat_idxs
+                                    ]
+                                    .clone()
+                                    .detach()
+                                ),
+                                (
+                                    x / x.norm(dim=-1, keepdim=True)
+                                    if group == GSParameters.ROTATION
+                                    else (
+                                        self._params[GSParameters.ROTATION.name][
+                                            flat_idxs
+                                        ]
+                                        .clone()
+                                        .detach()
+                                        / self._params[GSParameters.ROTATION.name][
+                                            flat_idxs
+                                        ]
+                                        .clone()
+                                        .detach()
+                                        .norm(dim=-1, keepdim=True)
+                                    )
+                                ),
+                                (
+                                    x
+                                    if group == GSParameters.SCALE
+                                    else self._params[GSParameters.SCALE.name][
+                                        flat_idxs
+                                    ]
+                                    .clone()
+                                    .detach()
+                                ),
+                                torch.sigmoid(
+                                    x
+                                    if group == GSParameters.OPACITY
+                                    else self._params[GSParameters.OPACITY.name][
+                                        flat_idxs
+                                    ]
+                                    .clone()
+                                    .detach()
+                                ),
+                                (
+                                    x
+                                    if group == GSParameters.COLOR
+                                    else self._params[GSParameters.COLOR.name][
+                                        flat_idxs
+                                    ]
+                                    .clone()
+                                    .detach()
+                                ),
+                                self._params[GSParameters.CAMERA.name].clone().detach(),
+                                self._params[GSParameters.VIEW.name].clone().detach(),
+                            )
 
-                # NOTE. step only increase for each iteration, NOT each tile
-                for group in groups:
-                    optimizers[group.name].state[self._params[group.name]][
-                        "step"
-                    ] += 1.0
+                            forward_fn = lambda x: self._loss_fn(
+                                render_fn(x)[0], tile_gt_img
+                            )
 
+                            start = time.time()
+                            jacob = torch.autograd.functional.jacobian(
+                                forward_fn,
+                                self._params[group.name][flat_idxs].clone().detach(),
+                                strict=True,
+                            )
+                            end = time.time()
+                            avg_jacob_elapsed += float(end - start)
+
+                            start = time.time()
+                            hess = torch.autograd.functional.hessian(
+                                forward_fn,
+                                self._params[group.name][flat_idxs].clone().detach(),
+                                strict=True,
+                            )
+                            end = time.time()
+                            avg_hess_elapsed += float(end - start)
+                            hess = hess.reshape([jacob.numel(), jacob.numel()])
+                            hess_inv = torch.linalg.pinv(hess)
+
+                            update = -1.0 * hess_inv @ jacob.reshape([-1, 1])
+                            update = update.reshape(jacob.shape)
+
+                            self._params[group.name][flat_idxs] = (
+                                self._params[group.name][flat_idxs] + update
+                            )
+                    else:
+                        raise NotImplementedError(
+                            f"NOT support tile-based solver: {solver_type}!"
+                        )
+
+                if solver_type == SolverType.ADAM:
+                    # NOTE. step only increase for each iteration, NOT each tile
+                    for group in groups:
+                        optimizers[group.name].state[self._params[group.name]][
+                            "step"
+                        ] += 1.0
+
+                avg_jacob_elapsed = float(avg_jacob_elapsed) / tile_cnt
+                avg_hess_elapsed = float(avg_hess_elapsed) / tile_cnt
                 avg_splats_per_tile = float(avg_splats_per_tile) / tile_cnt
                 LOGGER.info(
-                    f"Step={i}, #Tiles={tile_cnt}, #SplatsPerTile={avg_splats_per_tile:.4f}."
+                    f"Step={i}, #Tiles={tile_cnt}, #SplatsPerTile={avg_splats_per_tile:.4f}, "
+                    + f"JacobianTime={avg_jacob_elapsed:.4f} seconds, "
+                    + f"HessianTime={avg_hess_elapsed:.4f} seconds."
                 )
                 writer.add_scalar("NumberOfTiles", tile_cnt, global_step=i)
                 writer.add_scalar(
                     "AverageSplatsPerTile", avg_splats_per_tile, global_step=i
                 )
+                writer.add_scalar(
+                    "JacobianTimePerTile", avg_jacob_elapsed, global_step=i
+                )
+                writer.add_scalar("HessianTimePerTile", avg_hess_elapsed, global_step=i)
 
             elif solver_level == SolverLevel.RAY:
                 raise NotImplementedError(
                     f"Extra depth prior required for level={solver_level}!"
                 )
-
-            #         render_fn = lambda x: rasterize_to_pixels_tile_forward(
-            #             tile_x,
-            #             tile_y,
-            #             tile_size,
-            #             tile_size,
-            #             self._img_w,
-            #             self._img_h,
-            #             (
-            #                 x
-            #                 if group == GSParameters.POSITION
-            #                 else self._params[GSParameters.POSITION.name][flat_idxs]
-            #             ),
-            #             (
-            #                 x / x.norm(dim=-1, keepdim=True)
-            #                 if group == GSParameters.ROTATION
-            #                 else (
-            #                     self._params[GSParameters.ROTATION.name][flat_idxs]
-            #                     / self._params[GSParameters.ROTATION.name][
-            #                         flat_idxs
-            #                     ].norm(dim=-1, keepdim=True)
-            #                 )
-            #             ),
-            #             (
-            #                 x
-            #                 if group == GSParameters.SCALE
-            #                 else self._params[GSParameters.SCALE.name][flat_idxs]
-            #             ),
-            #             torch.sigmoid(
-            #                 x
-            #                 if group == GSParameters.OPACITY
-            #                 else self._params[GSParameters.OPACITY.name][flat_idxs]
-            #             ),
-            #             (
-            #                 x
-            #                 if group == GSParameters.COLOR
-            #                 else self._params[GSParameters.COLOR.name][flat_idxs]
-            #             ),
-            #             self._params[GSParameters.CAMERA.name],
-            #             self._params[GSParameters.VIEW.name],
-            #         )
 
         writer.close()
 
