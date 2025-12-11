@@ -8,10 +8,10 @@ EPS = 1e-12
 
 
 def project_points_3d_to_2d(
-    pnts3d: torch.FloatTensor,
-    view_mats: torch.FloatTensor,
-    cam_mats: torch.FloatTensor,
-) -> torch.FloatTensor:
+    pnts3d: torch.Tensor,
+    view_mats: torch.Tensor,
+    cam_mats: torch.Tensor,
+) -> torch.Tensor:
     """Project means from 3d world to 2d image plane.
 
     Args:
@@ -52,8 +52,8 @@ def get_tile_size(
 
 
 def quaternion_to_rotation_matrix(
-    quats: torch.FloatTensor,
-) -> torch.FloatTensor:
+    quats: torch.Tensor,
+) -> torch.Tensor:
     """Convert quaternion to rotation matrix."""
     quats = F.normalize(quats, p=2, dim=-1)
     w, x, y, z = torch.unbind(quats, dim=-1)
@@ -75,8 +75,8 @@ def quaternion_to_rotation_matrix(
 
 
 def compute_covariance_3d(
-    quats: torch.FloatTensor,  # Dim = [tK, 4]
-    scales: torch.FloatTensor,  # Dim = [tK, 3]
+    quats: torch.Tensor,  # Dim = [tK, 4]
+    scales: torch.Tensor,  # Dim = [tK, 3]
 ):
     """Compute 3D covariance from scale and quaternion."""
     rot_mats = quaternion_to_rotation_matrix(quats)
@@ -93,8 +93,8 @@ def compute_gaussian_weights_2d_tile(
     tile_size_h: int,
     img_w: int,
     img_h: int,
-    means2d: torch.FloatTensor,
-    conics2d: torch.FloatTensor,
+    means2d: torch.Tensor,
+    conics2d: torch.Tensor,
 ):
     """Compute 2D gaussian weights for each pixel within tile.
 
@@ -144,8 +144,8 @@ def compute_gaussian_weights_2d_tile(
 
 
 def compute_pinhole_jacobian(
-    cam_mats: torch.FloatTensor,
-    cam_means3d: torch.FloatTensor,
+    cam_mats: torch.Tensor,
+    cam_means3d: torch.Tensor,
     img_w: int,
     img_h: int,
 ):
@@ -203,15 +203,15 @@ def compute_pinhole_jacobian(
 
 
 def project_gaussians_3d_to_2d(
-    view_mats: torch.FloatTensor,
-    cam_mats: torch.FloatTensor,
-    means3d: torch.FloatTensor,
-    covars3d: torch.FloatTensor,
+    view_mats: torch.Tensor,
+    cam_mats: torch.Tensor,
+    means3d: torch.Tensor,
+    covars3d: torch.Tensor,
     img_w: int,
     img_h: int,
     near_plane: float = 0.1,
     far_plane: float = 1e10,
-    opacities: Optional[torch.FloatTensor] = None,
+    opacities: Optional[torch.Tensor] = None,
     alpha_threshold: float = 1.0 / 255.0,
 ):
     """Project 3D means and covariance matrix to 2D.
@@ -309,9 +309,9 @@ def project_gaussians_3d_to_2d(
 
 
 def combine_sh_colors_from_coefficients(
-    view_dirs: torch.FloatTensor,
-    sh_coeffs: torch.FloatTensor,
-    sh_consts: Optional[torch.FloatTensor] = None,
+    view_dirs: torch.Tensor,
+    sh_coeffs: torch.Tensor,
+    sh_consts: Optional[torch.Tensor] = None,
 ):
     """Combine SH colors from (L + 1)^2 coefficients.
 
@@ -425,9 +425,9 @@ def combine_sh_colors_from_coefficients(
 
 
 def compute_sh_colors(
-    means3d: torch.FloatTensor,
-    view_mats: torch.FloatTensor,
-    sh_coeffs: torch.FloatTensor,
+    means3d: torch.Tensor,
+    view_mats: torch.Tensor,
+    sh_coeffs: torch.Tensor,
 ):
     """Combine spherical harmonic colors."""
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
@@ -438,9 +438,9 @@ def compute_sh_colors(
 
 
 def render_sh_colors_with_alphas(
-    sh_colors: torch.FloatTensor,
-    alphas: torch.FloatTensor,
-    masks: Optional[torch.BoolTensor] = None,
+    sh_colors: torch.Tensor,
+    alphas: torch.Tensor,
+    masks: Optional[torch.Tensor] = None,
 ):
     """Render spherical harmonics colors with alphas."""
     alphas = torch.clamp_max(alphas, 0.9999)
@@ -471,14 +471,14 @@ def rasterize_to_pixels_tile_forward(
     tile_size_h: int,
     img_w: int,
     img_h: int,
-    means3d: torch.FloatTensor,  # Dim = [tK, 3]
-    quats: torch.FloatTensor,  # Dim = [tK, 4]
-    scales: torch.FloatTensor,  # Dim = [tK, 3]
-    opacities: torch.FloatTensor,  # Dim = [tK]
-    sh_coeffs: torch.FloatTensor,  # Dim = [tK, (L + 1)^2, 3]
-    cam_mats: torch.FloatTensor,  # Dim = [mN, 3, 3]
-    view_mats: torch.FloatTensor,  # Dim =[mN, 4, 4]
-    masks: Optional[torch.FloatTensor] = None,
+    means3d: torch.Tensor,  # Dim = [tK, 3]
+    quats: torch.Tensor,  # Dim = [tK, 4]
+    scales: torch.Tensor,  # Dim = [tK, 3]
+    opacities: torch.Tensor,  # Dim = [tK]
+    sh_coeffs: torch.Tensor,  # Dim = [tK, (L + 1)^2, 3]
+    cam_mats: torch.Tensor,  # Dim = [mN, 3, 3]
+    view_mats: torch.Tensor,  # Dim =[mN, 4, 4]
+    masks: Optional[torch.Tensor] = None,
 ):
     """Torch tile-based rasterization implementation."""
     # Dim = [tK, 3, 3]
@@ -521,7 +521,7 @@ def rasterize_to_pixels_tile_forward(
     return rd_colors, rd_alphas, tile_bbox
 
 
-def compute_kernel_mean_2d(img: torch.FloatTensor, kernel: torch.FloatTensor):
+def compute_kernel_mean_2d(img: torch.Tensor, kernel: torch.Tensor):
     """Compute 2D kernel-weighted mean of an image."""
     c = img.shape[1]
 
@@ -536,11 +536,11 @@ def compute_kernel_mean_2d(img: torch.FloatTensor, kernel: torch.FloatTensor):
 
 
 def compute_kernel_covariance_2d(
-    img0: torch.FloatTensor,
-    mean_0: Optional[torch.FloatTensor] = None,
-    img1: Optional[torch.FloatTensor] = None,
-    mean_1: Optional[torch.FloatTensor] = None,
-    kernel: Optional[torch.FloatTensor] = None,
+    img0: torch.Tensor,
+    mean_0: Optional[torch.Tensor] = None,
+    img1: Optional[torch.Tensor] = None,
+    mean_1: Optional[torch.Tensor] = None,
+    kernel: Optional[torch.Tensor] = None,
 ):
     """Compute covariance between two images."""
     if img1 is not None:
@@ -574,7 +574,7 @@ class GroupSSIMLoss(_Loss):
         c1: float = 0.01**2,
         c2: float = 0.03**2,
         padding: Literal["same", "valid"] = "valid",
-        kernel: Optional[torch.FloatTensor] = None,
+        kernel: Optional[torch.Tensor] = None,
         size_average=None,
         reduce=None,
         reduction: Literal["mean", "sum", "none"] = "mean",
@@ -613,9 +613,7 @@ class GroupSSIMLoss(_Loss):
             + f"size={self._kernel_size}, mean={self._kernel_size // 2}, variance={self._sigma:.6f}."
         )
 
-    def forward(
-        self, input: torch.FloatTensor, target: torch.FloatTensor
-    ) -> torch.FloatTensor:
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute SSIM loss between source and target image."""
 
         assert (
