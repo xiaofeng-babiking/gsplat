@@ -437,7 +437,7 @@ def compute_sh_colors(
     return sh_colors
 
 
-def render_sh_colors_with_alphas(
+def blend_sh_colors_with_alphas(
     sh_colors: torch.Tensor,
     alphas: torch.Tensor,
     masks: Optional[torch.Tensor] = None,
@@ -455,7 +455,9 @@ def render_sh_colors_with_alphas(
         alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
         * blend_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
         * sh_colors[:, None, None, :, :]  # Dim = [mN, 1,  1,  tK, mC]
-        * masks[:, None, None, :, None].float(),  # Dim = [mN, 1, 1, tK, 1]
+        * (
+            masks[:, None, None, :, None].float() if masks is not None else 1.0
+        ),  # Dim = [mN, 1, 1, tK, 1]
         dim=-2,
     )
 
@@ -511,7 +513,7 @@ def rasterize_to_pixels_tile_forward(
 
     # Dim = [mN, tH, tW, tK]
     alphas = gausses2d * opacities
-    rd_colors, rd_alphas = render_sh_colors_with_alphas(sh_colors, alphas, masks)
+    rd_colors, rd_alphas = blend_sh_colors_with_alphas(sh_colors, alphas, masks)
 
     # tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
     rd_colors = rd_colors.permute([0, 3, 1, 2])
