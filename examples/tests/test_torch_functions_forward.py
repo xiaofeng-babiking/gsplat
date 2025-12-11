@@ -488,5 +488,5 @@ def test_rasterization_tile_backward():
 
 
 if __name__ == "__main__":
-    test_rasterization_tile_backward()
     test_rasterization_tile_forward()
+    test_rasterization_tile_backward()
