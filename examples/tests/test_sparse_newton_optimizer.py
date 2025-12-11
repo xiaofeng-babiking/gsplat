@@ -4,7 +4,7 @@ import time
 import torch
 
 from gsplat.optimizers.torch_functions_forward import blend_sh_colors_with_alphas
-from gsplat.optimizers.sparse_newton import _backward_render_to_sh_color
+from gsplat.optimizers.sparse_newton import _backward_render_to_sh_colors
 from gsplat.logger import create_logger
 
 LOGGER = create_logger(name=os.path.basename(__file__), level="INFO")
@@ -20,7 +20,7 @@ KWARGS = {
 }
 
 
-def test_backward_render_to_sh_color():
+def test_backward_render_to_sh_colors():
     """Test backward from render color to SH color."""
     name = "From_RENDER_To_SH_COLOR"
 
@@ -47,7 +47,7 @@ def test_backward_render_to_sh_color():
     jacob_auto = jacob_auto.permute([0, 2, 3, 4, 1])
 
     start = time.time()
-    jacob_ours, _ = _backward_render_to_sh_color(
+    jacob_ours, _ = _backward_render_to_sh_colors(
         num_chs=mC,
         alphas=alphas,
         masks=masks,
@@ -62,4 +62,4 @@ def test_backward_render_to_sh_color():
 
 
 if __name__ == "__main__":
-    test_backward_render_to_sh_color()
+    test_backward_render_to_sh_colors()

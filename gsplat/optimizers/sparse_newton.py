@@ -2,7 +2,7 @@ import torch
 from typing import Optional
 
 
-def _backward_render_to_sh_color(
+def _backward_render_to_sh_colors(
     num_chs: int,
     alphas: torch.Tensor,
     masks: Optional[torch.Tensor] = None,
