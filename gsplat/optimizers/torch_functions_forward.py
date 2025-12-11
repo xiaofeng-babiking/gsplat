@@ -131,16 +131,16 @@ def compute_gaussian_weights_2d_tile(
     tile_ys = means2d[:, :, 1][:, None, None, :] - tile_ys[None, :, :, None]
 
     # Dim = [mN, tH, tW, tK] * [mN, 1, 1, tK] -> [mN, tH, tW, tK]
-    tile_sigmas = 0.5 * (
+    sigmas = 0.5 * (
         tile_xs * tile_xs * conics2d[:, :, 0][:, None, None, :]
         + 2.0 * tile_xs * tile_ys * conics2d[:, :, 1][:, None, None, :]
         + tile_ys * tile_ys * conics2d[:, :, 2][:, None, None, :]
     )
 
     # Dim = [mN, tH, tW, tK]
-    tile_gausses2d = torch.exp(-tile_sigmas)
+    gausses2d = torch.exp(-sigmas)
     tile_bbox = (tile_xmin, tile_ymin, crop_w, crop_h)
-    return tile_gausses2d, tile_bbox
+    return gausses2d, tile_bbox
 
 
 def compute_pinhole_jacobian(
@@ -437,6 +437,33 @@ def compute_sh_colors(
     return sh_colors
 
 
+def render_sh_colors_with_alphas(
+    sh_colors: torch.FloatTensor,
+    alphas: torch.FloatTensor,
+    masks: Optional[torch.BoolTensor] = None,
+):
+    """Render spherical harmonics colors with alphas."""
+    alphas = torch.clamp_max(alphas, 0.9999)
+
+    # Dim = [mN, tH, tW, tK]
+    blend_alphas = torch.cumprod(1.0 - alphas, dim=-1)
+    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
+    blend_alphas[:, :, :, 0] = 1.0
+
+    # Dim = [mN, tH, tW, mC]
+    rd_colors = torch.sum(
+        alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
+        * blend_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
+        * sh_colors[:, None, None, :, :]  # Dim = [mN, 1,  1,  tK, mC]
+        * masks[:, None, None, :, None].float(),  # Dim = [mN, 1, 1, tK, 1]
+        dim=-2,
+    )
+
+    # Dim = [mN, tH, tW, tK]
+    rd_alphas = 1.0 - blend_alphas[:, :, :, -1][..., None]
+    return rd_colors, rd_alphas
+
+
 def rasterize_to_pixels_tile_forward(
     tile_x: int,
     tile_y: int,
@@ -476,36 +503,22 @@ def rasterize_to_pixels_tile_forward(
         masks = (radii > 0).all(dim=-1).float()
 
     # Dim = [mN, tH, tW, tK]
-    tile_gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
+    gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
         tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h, means2d, conics2d
     )
 
     sh_colors = compute_sh_colors(means3d, view_mats, sh_coeffs)
 
     # Dim = [mN, tH, tW, tK]
-    tile_alphas = tile_gausses2d * opacities
-    tile_alphas = torch.clamp_max(tile_alphas, 0.9999)
+    alphas = gausses2d * opacities
+    rd_colors, rd_alphas = render_sh_colors_with_alphas(sh_colors, alphas, masks)
 
-    # Dim = [mN, tH, tW, tK]
-    blend_alphas = torch.cumprod(1.0 - tile_alphas, dim=-1)
-    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
-    blend_alphas[:, :, :, 0] = 1.0
-
-    # Dim = [mN, tH, tW, mC]
-    tile_rgb = torch.sum(
-        tile_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
-        * blend_alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
-        * sh_colors[:, None, None, :, :]  # Dim = [mN, 1,  1,  tK, mC]
-        * masks[:, None, None, :, None],  # Dim = [mN, 1, 1, tK, 1]
-        dim=-2,
-    )
     # tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
-    tile_rgb = tile_rgb.permute([0, 3, 1, 2])
+    rd_colors = rd_colors.permute([0, 3, 1, 2])
 
     # Dim = [mN, tH, tW, 1]
-    tile_a = 1.0 - blend_alphas[:, :, :, -1][..., None]
-    tile_a = tile_a.permute([0, 3, 1, 2])
-    return tile_rgb, tile_a, tile_bbox
+    rd_alphas = rd_alphas.permute([0, 3, 1, 2])
+    return rd_colors, rd_alphas, tile_bbox
 
 
 def compute_kernel_mean_2d(img: torch.FloatTensor, kernel: torch.FloatTensor):
