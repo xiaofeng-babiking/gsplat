@@ -55,15 +55,16 @@ def _backward_render_to_sh_colors(
     blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
     blend_alphas[:, :, :, 0] = 1.0
 
-    # Dim = [mN, tH, tW, tK]
+    # Output:  Dim = [mN, tH, tW, mC]
+    # Input:   Dim = [tK, mC]
+    # Jacobian Dim = [mN, tH, tW, mC, tK, mC] -> [mN, tH, tW, tK, mC]
     jacob = (
         alphas
         * blend_alphas
         * (masks[:, None, None, :].float() if masks is not None else 1.0)
     )
-    jacob = jacob[..., None].repeat([1, 1, 1, 1, num_chs])
+    jacob = jacob[:, :, :, :, None].repeat([1, 1, 1, 1, num_chs])
 
-    # Dim = [mN, tH, tW, tK, mC, mC]
     hess = None
     return jacob, hess
 

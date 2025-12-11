@@ -64,13 +64,13 @@ def test_backward_render_to_sh_colors():
     )
     end = time.time()
     assert torch.allclose(
-        jacob_auto, jacob_ours, atol=1e-4, rtol=1e-3
+        jacob_auto, jacob_ours, rtol=1e-3
     ), f"{name} jacobian wrong values!"
-    assert jacob_ours.shape == (mN, tH, tW, mC), f"{name} jacobian wrong dimension!"
+    assert jacob_ours.shape == (mN, tH, tW, tK, mC), f"{name} jacobian wrong dimension!"
     LOGGER.info(
         f"Backward={name}, "
         + f"Output=[{mN}, {tH}, {tW}, {mC}], Input=[{mN}, {tK}, {mC}], "
-        + f"Jacobian=[{mN}, {tH}, {tW} {mC}], Hessian={None}, "
+        + f"Jacobian=[{mN}, {tH}, {tW} {tK}, {mC}], Hessian={None}, "
         + f"Elapsed={float(end - start):.6f} seconds."
     )
 
@@ -101,7 +101,7 @@ def test_backward_sh_colors_to_positions():
     # Input:  Dim = [tK, 3]
     # Jacobian: Dim = [mN, tK, mC, tK, 3] -> [mN, tK, mC, 3]
     jacob_auto = torch.autograd.functional.jacobian(
-        lambda x: compute_sh_colors(x, view_mats, sh_coeffs), means3d
+        lambda x: compute_sh_colors(x, view_mats, sh_coeffs, False), means3d
     )
     idxs = [i for i in range(tK)]
     jacob_auto = jacob_auto[:, idxs, :, idxs, :]
@@ -111,7 +111,7 @@ def test_backward_sh_colors_to_positions():
     # Input:  Dim = [tK, 3]
     # Hessian: Dim = [mN, tK, mC, tK, 3, tK, 3] -> [mN, tK, mC, 3, 3]
     hess_auto = torch.autograd.functional.hessian(
-        lambda x: compute_sh_colors(x, view_mats, sh_coeffs).sum(), means3d
+        lambda x: compute_sh_colors(x, view_mats, sh_coeffs, False).sum(), means3d
     )
     idxs = [i for i in range(tK)]
     # Dim = [tK, 3, 3]
@@ -130,13 +130,10 @@ def test_backward_sh_colors_to_positions():
     )
     end = time.time()
     assert torch.allclose(
-        jacob_auto, jacob_ours, atol=1e-3, rtol=1e-1
+        jacob_auto, jacob_ours, rtol=1e-3
     ), f"{name} jacobian wrong values!"
     assert torch.allclose(
-        hess_auto,
-        hess_ours.sum(dim=[0, 2]),
-        atol=1e-4,
-        rtol=1e-3,
+        hess_auto, hess_ours.sum(dim=[0, 2]), rtol=1e-3
     ), f"{name} hessian wrong values!"
     LOGGER.info(
         f"Backward={name}, "

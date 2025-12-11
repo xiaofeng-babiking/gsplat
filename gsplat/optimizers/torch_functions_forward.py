@@ -428,12 +428,14 @@ def compute_sh_colors(
     means3d: torch.Tensor,
     view_mats: torch.Tensor,
     sh_coeffs: torch.Tensor,
+    clamped: bool = True,
 ):
     """Combine spherical harmonic colors."""
     view_dirs = means3d[None, :, :] - torch.linalg.inv(view_mats)[:, :3, 3][:, None, :]
     # Dim = [mN, tK, mC]
     sh_colors = combine_sh_colors_from_coefficients(view_dirs, sh_coeffs)
-    sh_colors = torch.clamp_min(sh_colors + 0.5, 0.0)
+    if clamped:
+        sh_colors = torch.clamp_min(sh_colors + 0.5, 0.0)
     return sh_colors
 
 
