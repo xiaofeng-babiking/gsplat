@@ -13,6 +13,7 @@ from gsplat.optimizers.sparse_newton import (
     cache_sh_derivative_functions,
     _backward_render_to_sh_colors,
     _backward_sh_colors_to_positions,
+    _backward_render_to_gaussians2d,
 )
 from gsplat.logger import create_logger
 
@@ -143,6 +144,51 @@ def test_backward_sh_colors_to_positions():
     )
 
 
+def test_backward_render_to_gaussians2d():
+    """Test backward render to gaussian 2D weights."""
+    name = "From_RENDER_to_GAUSSIANS2D"
+
+    sh_colors = torch.rand(size=[mN, tK, mC], **KWARGS)
+
+    gaussians2d = torch.rand(size=[mN, tH, tW, tK], **KWARGS)
+
+    opacities = torch.rand(size=[tK], **KWARGS)
+
+    forward_fn = lambda _gaussians2d: blend_sh_colors_with_alphas(
+        sh_colors, alphas=_gaussians2d * opacities
+    )[0]
+
+    # Dim = [mN, tH, tW, mC, mN, tH, tW, tK]
+    jacob_auto = torch.autograd.functional.jacobian(forward_fn, gaussians2d)
+    ns, hs, ws = torch.meshgrid(
+        [
+            torch.arange(0, mN, **KWARGS).int(),
+            torch.arange(0, tH, **KWARGS).int(),
+            torch.arange(0, tW, **KWARGS).int(),
+        ],
+        indexing="ij",
+    )
+    jacob_auto = jacob_auto[ns, hs, ws, :, ns, hs, ws, :]
+
+    start = time.time()
+    jacob_ours, _ = _backward_render_to_gaussians2d(
+        sh_colors,
+        opacities,
+        alphas=gaussians2d * opacities,
+    )
+    end = time.time()
+    assert torch.allclose(
+        jacob_auto, jacob_ours, rtol=1e-2
+    ), f"{name} jacobian wrong values!"
+    LOGGER.info(
+        f"Backward={name}, "
+        + f"Output=[{mN}, {tH}, {tW}, {mC}], Input=[{mN}, {tH}, {tW}, {tK}], "
+        + f"Jacobian=[{mN}, {tH}, {tW}, {mC}, {tK}], Hessian={None}, "
+        + f"Elapsed={float(end - start):.6f} seconds."
+    )
+
+
 if __name__ == "__main__":
+    test_backward_render_to_gaussians2d()
     test_backward_sh_colors_to_positions()
     test_backward_render_to_sh_colors()

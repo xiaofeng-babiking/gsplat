@@ -23,6 +23,17 @@ SPHERICAL_HARMONICS_CONSTANTS = [
 ]
 
 
+def compute_blend_alphas(alphas: torch.Tensor):
+    """Compute blended alphas by cumprod."""
+    alphas = torch.clamp_max(alphas, 0.9999)
+
+    # Dim = [mN, tH, tW, tK]
+    blend_alphas = torch.cumprod(1.0 - alphas, dim=-1)
+    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
+    blend_alphas[:, :, :, 0] = 1.0
+    return alphas, blend_alphas
+
+
 def _backward_render_to_sh_colors(
     num_chs: int,
     alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
@@ -51,9 +62,7 @@ def _backward_render_to_sh_colors(
     alphas = torch.clamp_max(alphas, 0.9999)
 
     # Dim = [mN, tH, tW, tK]
-    blend_alphas = torch.cumprod(1.0 - alphas, dim=-1)
-    blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
-    blend_alphas[:, :, :, 0] = 1.0
+    alphas, blend_alphas = compute_blend_alphas(alphas)
 
     # Output:  Dim = [mN, tH, tW, mC]
     # Input:   Dim = [tK, mC]
@@ -177,7 +186,7 @@ def _backward_sh_colors_to_positions(
 
     # SH-Value          Dim = [mN, tK, (L+1)^2]
     # Directions        Dim = [mN, tK, 3]
-    # SH-Value-to-Direction-jacobian Dim = [mN, tK, (L+1)^2, 3]
+    # Jacobian-SH-Value-to-Direction Dim = [mN, tK, (L+1)^2, 3]
     x = view_dirs[:, :, 0]
     y = view_dirs[:, :, 1]
     z = view_dirs[:, :, 2]
@@ -244,4 +253,108 @@ def _backward_sh_colors_to_positions(
     if masks is not None:
         jacob = jacob * masks[:, :, None, None].float()
         hess = hess * masks[:, :, None, None, None].float()
+    return jacob, hess
+
+
+def _backward_render_to_gaussians2d(
+    sh_colors: torch.Tensor,
+    opacities: torch.Tensor,
+    alphas: torch.Tensor,
+    masks: Optional[torch.BoolTensor] = None,
+):
+    """Backward render colors to gaussian 2d weights.
+    Args:
+        [1] sh_colors: Spherical harmonic colors of each pixel, Dim = [mN, tK, mC].
+        [2] opacities: Opacity of each pixel, Dim = [tK].
+        [3] alphas: Alphas of each pixel on the tile, Dim = [mN, tH, tW, tK].
+        [4] masks: Masks of valid gaussian splats, Dim = [mN, tK].
+
+    Returns:
+        [1] jacob: Jacobian matrix of each pixel w.r.t. Gaussian kernel 2D weights.
+                Output: Dim = [mN, tH, tW, mC]
+                Input:  Dim = [mN, tH, tW, tK]
+                Jacobian: Dim = [mN, tH, tW, tK, mC]
+        [2] hess: Hessian matrix of each pixel w.r.t. Gaussian kernel 2D weights.
+
+    For pixel (m, n),
+
+    RGB = SUM_k^{tK}(α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)))
+        where, α(j) = G(j) * σ(j)
+
+    ∂(RGB) / ∂(G(0))
+        = ∂(RGB)/ ∂(α(0)) @ ∂(α(0)) / ∂(G(0))
+        = ∂(RGB)/ ∂(α(0)) * σ(0)
+        = σ(0) * (
+            + α(0) * SH(0) * 1.0 / α(0)
+            - α(1) * SH(1) * CUMPROD_j^{0}(1.0 - α(j)) / (1 - α(0))
+            - α(2) * SH(2) * CUMPROD_j^{1}(1.0 - α(j)) / (1 - α(0))
+            ...
+            - α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)) / (1 - α(0))
+        )
+
+    ∂(RGB) / ∂(G(1))
+        = σ(1) * (
+            + α(1) * SH(1) * CUMPROD_j^{0}(1.0 - α(j)) / α(1)
+            - α(2) * SH(2) * CUMPROD_j^{0}(1.0 - α(j)) / (1 - α(1))
+            - α(3) * SH(3) * CUMPROD_j^{1}(1.0 - α(j)) / (1 - α(1))
+            ...
+            - α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)) / (1 - α(1))
+        )
+
+
+    ...
+
+    Let β(k) = α(k) * SH(k) * CUMPROD_j^{k - 1}(1.0 - α(j)),
+    Then,
+        S = [σ(0), σ(1), ..., σ(k)].T
+        B = [β(0), β(1), ..., β(k)].T
+        W = [
+                [1.0 / α(0), -1.0 / (1.0 - α(0)),    ...     ,                       -1.0 / (1.0 - α(0))],
+                [0.0,            1.0 / α(1)    , -1.0 / (1.0 - α(1)),      ... ,     -1.0 / (1.0 - α(1))],
+                ...
+                [0.0,     0.0    ,    ...     ,                  1.0 / α(k - 1), -1.0 / (1.0 - α(k - 1))],
+                [0.0,     0.0    ,    ...     ,                         0.0,                  1.0 / α(k)],
+        ]
+        ∂(RGB) / ∂(G(k)) = S * W @ B
+    """
+    # Dim = [mN, tH, tW, tK]
+    alphas, blend_alphas = compute_blend_alphas(alphas)
+
+    # alphas:    Dim = [mN, tH, tW, tK]
+    # sh-colors: Dim = [mN, tK, mC]
+    # betas:     Dim = [mN, tH, tW, tK, mC]
+    betas = (
+        alphas[:, :, :, :, None]  # Dim = [mN, tH, tW, tK, 1]
+        * blend_alphas[:, :, :, :, None]  # Dim = [mN, tH, tW, tK, 1]
+        * sh_colors[:, None, None, :, :]  # Dim = [mN, 1,  1,  tK, mC]
+    )
+
+    tile_size_h, tile_size_w = alphas.shape[1:3]
+    n_splats = len(opacities)
+
+    # Dim = [tH, tW, tK, tK]
+    omegas = torch.ones(
+        size=[tile_size_h, tile_size_w, n_splats, n_splats],
+        dtype=alphas.dtype,
+        device=alphas.device,
+    )
+    omegas = torch.triu(omegas, diagonal=0)
+    # Dim = [mN, tH, tW, tK, tK] <- [1, tH, tW, tK, tK] / [mN, tH, tW, tK, 1]
+    omegas = -omegas[None, :, :, :, :] / (1.0 - alphas[:, :, :, :, None])
+
+    splat_idxs = list(range(n_splats))
+    omegas[:, :, :, splat_idxs, splat_idxs] = 1.0 / (alphas + 1e-12)
+
+    # Output: Dim = [mN, tH, tW, mC]
+    # Input:  Dim = [mN, tH, tW, tK]
+    # Jacobian: Dim = [mN, tH, tW, tK, mC] <- [mN, tH, tW, tK, tK] @ [mN, tH, tW, tK, mC]
+    jacob = torch.einsum("ijklm,ijkmn->ijkln", omegas, betas)
+    # Dim = [mN, tH, tW, mC, tK]
+    jacob = jacob.permute([0, 1, 2, 4, 3])
+    jacob = jacob * opacities
+
+    hess = None
+
+    if masks is not None:
+        jacob = jacob * masks[:, None, None, None, :].float()
     return jacob, hess
