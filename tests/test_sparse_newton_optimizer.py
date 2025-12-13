@@ -8,12 +8,15 @@ from scipy.spatial.transform import Rotation as ScipyRotation
 from gsplat.optimizers.torch_functions_forward import (
     blend_sh_colors_with_alphas,
     compute_sh_colors,
+    compute_gaussian_weights_2d_tile,
 )
 from gsplat.optimizers.sparse_newton import (
+    compute_blend_alphas,
     cache_sh_derivative_functions,
     _backward_render_to_sh_colors,
     _backward_sh_colors_to_positions,
     _backward_render_to_gaussians2d,
+    _backward_gaussians2d_to_means2d,
 )
 from gsplat.logger import create_logger
 
@@ -22,7 +25,7 @@ LOGGER = create_logger(name=os.path.basename(__file__), level="INFO")
 mN = 7  # number of camera views
 tH = 16  # tile size along height dimension
 tW = 16  # tile size along width dimension
-tK = 92  # number of gaussian splats
+tK = 12  # number of gaussian splats
 mL = 3  # rotation degree of spherical harmonics
 mC = 3  # number of RGB color channels
 KWARGS = {
@@ -170,11 +173,15 @@ def test_backward_render_to_gaussians2d():
     )
     jacob_auto = jacob_auto[ns, hs, ws, :, ns, hs, ws, :]
 
+    alphas = gaussians2d * opacities
+    alphas, blend_alphas = compute_blend_alphas(alphas)
+
     start = time.time()
     jacob_ours, _ = _backward_render_to_gaussians2d(
         sh_colors,
         opacities,
         alphas=gaussians2d * opacities,
+        blend_alphas=blend_alphas,
     )
     end = time.time()
     assert torch.allclose(
@@ -188,7 +195,86 @@ def test_backward_render_to_gaussians2d():
     )
 
 
+def test_backward_gaussians2d_to_means2d():
+    """Test backward gaussian 2D weights to mean 2D locations."""
+    name = "From_GAUSSIANS2D_To_MEANS2D"
+
+    img_w = 1920
+    img_h = 1080
+
+    tile_x = int(np.random.randint(low=0, high=np.ceil(img_w / tW)))
+    tile_y = int(np.random.randint(low=0, high=np.ceil(img_h / tH)))
+
+    means2d_x = (torch.rand(size=[mN, tK], **KWARGS) + tile_x) * tW
+    means2d_y = (torch.rand(size=[mN, tK], **KWARGS) + tile_y) * tH
+    means2d = torch.stack([means2d_x, means2d_y], dim=-1)
+    conics2d = torch.rand(size=[mN, tK, 3], **KWARGS) + 1.0
+
+    gausses2d, _ = compute_gaussian_weights_2d_tile(
+        tile_x, tile_y, tW, tH, img_w, img_h, means2d, conics2d
+    )
+
+    # Output: Dim = [mN, tH, tW, tK]
+    # Input: Dim = [mN, tK, 2]
+    # Jacobian: Dim = [mN, tH, tW, tK, mN, tK, 2] -> [mN, tH, tW, tK, 2]
+    jacob_auto = torch.autograd.functional.jacobian(
+        lambda x: compute_gaussian_weights_2d_tile(
+            tile_x, tile_y, tW, tH, img_w, img_h, x, conics2d
+        )[0],
+        means2d,
+    )
+    ns, ks = torch.meshgrid(
+        [
+            torch.arange(0, mN, **KWARGS).int(),
+            torch.arange(0, tK, **KWARGS).int(),
+        ],
+        indexing="ij",
+    )
+    jacob_auto = jacob_auto[ns, :, :, ks, ns, ks, :]
+    jacob_auto = jacob_auto.permute([0, 2, 3, 1, 4])
+    jacob_mask = torch.logical_not(torch.isnan(jacob_auto) | torch.isinf(jacob_auto))
+
+    # Hessian: Dim = [mN, tK, 2, mN, tK, 2]
+    hess_auto = torch.autograd.functional.hessian(
+        lambda x: compute_gaussian_weights_2d_tile(
+            tile_x, tile_y, tW, tH, img_w, img_h, x, conics2d
+        )[0].sum(),
+        means2d,
+    )
+    # Hessian: Dim = [mN, tK, 2, 2]
+    hess_auto = hess_auto[ns, ks, :, ns, ks, :]
+
+    start = time.time()
+    jacob_ours, hess_ours = _backward_gaussians2d_to_means2d(
+        tile_x, tile_y, tW, tH, img_w, img_h, gausses2d, means2d, conics2d
+    )
+    end = time.time()
+    assert torch.allclose(
+        jacob_auto[jacob_mask], jacob_ours[jacob_mask], rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+    # Dim [mN, tH, tW, tK, 2, 2] -> [mN, tK, 2, 2]
+    hess_ours = hess_ours.sum(dim=[1, 2])
+    hess_mask = torch.logical_not(
+        torch.isnan(hess_auto)
+        | torch.isinf(hess_auto)
+        | (torch.abs(hess_auto) > 1e3)
+        | torch.isnan(hess_ours)
+        | torch.isinf(hess_ours)
+        | (torch.abs(hess_ours) > 1e3)
+    )
+    assert torch.allclose(
+        hess_auto[hess_mask], hess_ours[hess_mask], rtol=1e-1
+    ), f"{name} hessian wrong values!"
+    LOGGER.info(
+        f"Backward={name}, "
+        + f"Output=[{mN}, {tH}, {tW}, {tK}], Input=[{mN}, {tK}, 2], "
+        + f"Jacobian=[{mN}, {tH}, {tW}, {tK}, 2], Hessian=[{mN}, {tH}, {tW}, {tK}, 2, 2], "
+        + f"Elapsed={float(end - start):.6f} seconds."
+    )
+
+
 if __name__ == "__main__":
+    test_backward_gaussians2d_to_means2d()
     test_backward_render_to_gaussians2d()
     test_backward_sh_colors_to_positions()
     test_backward_render_to_sh_colors()

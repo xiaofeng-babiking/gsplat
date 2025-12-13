@@ -23,6 +23,25 @@ SPHERICAL_HARMONICS_CONSTANTS = [
 ]
 
 
+def get_tile_size(
+    tile_x: int,
+    tile_y: int,
+    tile_size_w: int,
+    tile_size_h: int,
+    img_w: int,
+    img_h: int,
+):
+    """Get valid tile size within image."""
+    tile_xmin = tile_x * tile_size_w
+    tile_ymin = tile_y * tile_size_h
+    tile_xmax = min(img_w, tile_xmin + tile_size_w)
+    tile_ymax = min(img_h, tile_ymin + tile_size_h)
+
+    crop_w = tile_xmax - tile_xmin
+    crop_h = tile_ymax - tile_ymin
+    return tile_xmin, tile_ymin, crop_w, crop_h
+
+
 def compute_blend_alphas(alphas: torch.Tensor):
     """Compute blended alphas by cumprod."""
     alphas = torch.clamp_max(alphas, 0.9999)
@@ -260,6 +279,7 @@ def _backward_render_to_gaussians2d(
     sh_colors: torch.Tensor,
     opacities: torch.Tensor,
     alphas: torch.Tensor,
+    blend_alphas: torch.Tensor,
     masks: Optional[torch.BoolTensor] = None,
 ):
     """Backward render colors to gaussian 2d weights.
@@ -267,6 +287,7 @@ def _backward_render_to_gaussians2d(
         [1] sh_colors: Spherical harmonic colors of each pixel, Dim = [mN, tK, mC].
         [2] opacities: Opacity of each pixel, Dim = [tK].
         [3] alphas: Alphas of each pixel on the tile, Dim = [mN, tH, tW, tK].
+        [4] blend_alphas: Blended alphas, torch.Tensor, Dim = [mN, tH, tW, tK].
         [4] masks: Masks of valid gaussian splats, Dim = [mN, tK].
 
     Returns:
@@ -317,9 +338,6 @@ def _backward_render_to_gaussians2d(
         ]
         ∂(RGB) / ∂(G(k)) = S * W @ B
     """
-    # Dim = [mN, tH, tW, tK]
-    alphas, blend_alphas = compute_blend_alphas(alphas)
-
     # alphas:    Dim = [mN, tH, tW, tK]
     # sh-colors: Dim = [mN, tK, mC]
     # betas:     Dim = [mN, tH, tW, tK, mC]
@@ -357,4 +375,94 @@ def _backward_render_to_gaussians2d(
 
     if masks is not None:
         jacob = jacob * masks[:, None, None, None, :].float()
+    return jacob, hess
+
+
+def _backward_gaussians2d_to_means2d(
+    tile_x: int,
+    tile_y: int,
+    tile_size_w: int,
+    tile_size_h: int,
+    img_w: int,
+    img_h: int,
+    gaussians2d: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+    means2d: torch.Tensor,  # Dim = [mN, tK, 2]
+    conics2d: torch.Tensor,  # Dim = [mN, tK, 3]
+):
+    """Backward from 2D Gaussian weights to 2D positions.
+
+    Args:
+        [1] tile_x: Tile column index, int.
+        [2] tile_y: Tile row index, int.
+        [3] tile_size_w: Tile width, int.
+        [4] tile_size_h: Tile height, int.
+        [4] img_w: Image width, int.
+        [5] img_h: Image height, int.
+        [6] gaussians2d: 2D gaussian weights of each pixel, Dim = [mN, tH, tW, tK].
+        [7] means2d: 2D positions of each Gaussian kernel, Dim = [mN, tK, 2].
+        [8] conics2d: Inverse covariance matrices of each Gaussian kernel, Dim = [mN, tK, 3].
+
+    Returns:
+        [1] jacob: Jacobian matrix of Gaussian kernel parameters w.r.t. means2d.
+                Output: Dim = [mN, tH, tW, tK]
+                Input:  Dim = [mN, tK, 2]
+                Jacobian: Dim = [mN, tH, tW, tK, 2]
+        [2] hess: Hessian matrix of Gaussian kernel parameters w.r.t. means2d.
+                Hessian:  Dim = [mN, tH, tW, tK, 2, 2]
+
+    G(k, m, n) = exp(-0.5 * (x(m, n) - means2d(k)).T @ conics2d @ (x(m, n) - means2d(k)))
+
+    ∂(G(k, m, n)) / ∂(means2d(k))
+        = -G(k, m, n) * conics2d.T * (means2d(k) - x(m, n))
+    ∂²(G(k, m, n)) / ∂(means2d(k))²
+        = G(k, m, n) * (conics2d.T * (means2d(k) - x(m, n)).T @ (conics2d.T * (means2d(k) - x(m, n))
+            - G(k, m, n) * conics2d
+    """
+    tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
+        tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h
+    )
+
+    tile_ys, tile_xs = torch.meshgrid(
+        torch.arange(crop_h, dtype=means2d.dtype, device=means2d.device),
+        torch.arange(crop_w, dtype=means2d.dtype, device=means2d.device),
+        indexing="ij",
+    )
+
+    tile_xs = tile_xs + tile_xmin + 0.5
+    tile_ys = tile_ys + tile_ymin + 0.5
+
+    tile_xs = means2d[:, :, 0][:, None, None, :] - tile_xs[None, :, :, None]
+    tile_ys = means2d[:, :, 1][:, None, None, :] - tile_ys[None, :, :, None]
+
+    # Dim = [mN, tH, tW, tK, 2]
+    term_0 = torch.stack(
+        [
+            tile_xs * conics2d[:, :, 0][:, None, None, :]
+            + tile_ys * conics2d[:, :, 1][:, None, None, :],
+            tile_xs * conics2d[:, :, 1][:, None, None, :]
+            + tile_ys * conics2d[:, :, 2][:, None, None, :],
+        ],
+        dim=-1,
+    )
+    jacob = -gaussians2d[:, :, :, :, None] * term_0
+
+    hess = gaussians2d[:, :, :, :, None, None] * torch.einsum(
+        "ijklmn,ijklnp->ijklmp",
+        term_0[:, :, :, :, :, None],
+        term_0[:, :, :, :, None, :],
+    )
+    # Dim = [mN, tH, tW, tK, 3]
+    term_1 = gaussians2d[:, :, :, :, None] * conics2d[:, None, None, :, :]
+    term_1 = torch.stack(
+        [
+            term_1[:, :, :, :, 0],
+            term_1[:, :, :, :, 1],
+            term_1[:, :, :, :, 1],
+            term_1[:, :, :, :, 2],
+        ],
+        dim=-1,
+    )
+    term_1 = term_1.reshape(list(term_1.shape[:-1]) + [2, 2])
+    # Dim = [mN, tH, tW, tK, 2, 2]
+    hess = hess - term_1
     return jacob, hess
