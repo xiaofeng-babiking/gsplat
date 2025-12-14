@@ -19,6 +19,7 @@ from gsplat.optimizers.sparse_newton import (
     _backward_render_to_gaussians2d,
     _backward_gaussians2d_to_means2d,
     _backward_means2d_to_means3d,
+    _backward_conics2d_to_covars2d,
 )
 from gsplat.logger import create_logger
 
@@ -372,7 +373,64 @@ def test_backward_means2d_to_means3d():
     )
 
 
+def test_backward_conics2d_to_covars2d():
+    """Test backward 2D gaussian inverse covariance to covariance matrices."""
+    name = "From_CONICS2D_TO_COVARS2D"
+
+    covars2d = torch.rand(size=[mN, tK, 3], **KWARGS)
+    covars2d_mat = torch.zeros(
+        size=list(covars2d.shape[:-1]) + [2, 2],
+        dtype=covars2d.dtype,
+        device=covars2d.device,
+    )
+    covars2d_mat[..., 0, 0] = covars2d[..., 0]
+    covars2d_mat[..., 0, 1] = covars2d[..., 1]
+    covars2d_mat[..., 1, 0] = covars2d[..., 1]
+    covars2d_mat[..., 1, 1] = covars2d[..., 2]
+
+    conics2d_mat = torch.linalg.inv(covars2d_mat)
+    conics2d = torch.zeros(size=list(conics2d_mat.shape[:-2]) + [3], **KWARGS)
+    conics2d[..., 0] = conics2d_mat[..., 0, 0]
+    conics2d[..., 1] = conics2d_mat[..., 0, 1]
+    conics2d[..., 2] = conics2d_mat[..., 1, 1]
+
+    jacob_auto = torch.autograd.functional.jacobian(
+        lambda x: torch.linalg.inv(x), covars2d_mat
+    )
+    ns, ks = torch.meshgrid(
+        [
+            torch.arange(mN, **KWARGS).int(),
+            torch.arange(tK, **KWARGS).int(),
+        ],
+        indexing="ij",
+    )
+    jacob_auto = jacob_auto[ns, ks, :, :, ns, ks, :, :]
+
+    hess_auto = torch.autograd.functional.hessian(
+        lambda x: torch.linalg.inv(x).sum(), covars2d_mat
+    )
+    hess_auto = hess_auto[ns, ks, :, :, ns, ks, :, :]
+
+    start = time.time()
+    jacob_ours, hess_ours = _backward_conics2d_to_covars2d(conics2d)
+    end = time.time()
+    hess_ours = hess_ours.sum(dim=[2, 3])
+    assert torch.allclose(
+        jacob_auto, jacob_ours, rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+    assert torch.allclose(
+        hess_auto, hess_ours, rtol=1e-3
+    ), f"{name} hessian wrong values!"
+    LOGGER.info(
+        f"Backward={name}, "
+        + f"Output=[{mN}, {tK}, 2, 2], Input=[{mN}, {tK}, 2, 2], "
+        + f"Jacobian=[{mN}, {tK}, 2, 2, 2, 2], Hessian=[{mN}, {tK}, 2, 2, 2, 2, 2, 2], "
+        + f"Elapsed={float(end - start):.6f} seconds."
+    )
+
+
 if __name__ == "__main__":
+    test_backward_conics2d_to_covars2d()
     test_backward_means2d_to_means3d()
     test_backward_gaussians2d_to_means2d()
     test_backward_render_to_gaussians2d()

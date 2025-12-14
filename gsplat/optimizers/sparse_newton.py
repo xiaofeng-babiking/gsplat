@@ -535,3 +535,39 @@ def _backward_means2d_to_means3d(
         pw_2, pw_2
     )
     return jacob, hess
+
+
+def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
+    """Backward from inverse covariance matrices to covariance matrices."""
+    conics2d_mat = torch.zeros(
+        size=list(conics2d.shape[:-1]) + [2, 2],
+        dtype=conics2d.dtype,
+        device=conics2d.device,
+    )
+    conics2d_mat[..., 0, 0] = conics2d[..., 0]
+    conics2d_mat[..., 0, 1] = conics2d[..., 1]
+    conics2d_mat[..., 1, 0] = conics2d[..., 1]
+    conics2d_mat[..., 1, 1] = conics2d[..., 2]
+
+    i, j, p, l = torch.meshgrid(
+        [
+            torch.arange(2, dtype=conics2d.dtype, device=conics2d.device).int()
+            for _ in range(4)
+        ],
+        indexing="ij",
+    )
+
+    jacob = -conics2d_mat[..., p, i] * conics2d_mat[..., j, l]
+
+    i, j, p, l, g, h = torch.meshgrid(
+        [
+            torch.arange(2, dtype=conics2d.dtype, device=conics2d.device).int()
+            for _ in range(6)
+        ],
+        indexing="ij",
+    )
+    hess = (
+        conics2d_mat[..., g, i] * conics2d_mat[..., p, h] * conics2d_mat[..., j, l]
+        + conics2d_mat[..., p, i] * conics2d_mat[..., g, l] * conics2d_mat[..., j, h]
+    )
+    return jacob, hess
