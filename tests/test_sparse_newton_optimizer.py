@@ -9,6 +9,7 @@ from gsplat.optimizers.torch_functions_forward import (
     blend_sh_colors_with_alphas,
     compute_sh_colors,
     compute_gaussian_weights_2d_tile,
+    project_points_3d_to_2d,
 )
 from gsplat.optimizers.sparse_newton import (
     compute_blend_alphas,
@@ -17,6 +18,7 @@ from gsplat.optimizers.sparse_newton import (
     _backward_sh_colors_to_positions,
     _backward_render_to_gaussians2d,
     _backward_gaussians2d_to_means2d,
+    _backward_means2d_to_means3d,
 )
 from gsplat.logger import create_logger
 
@@ -273,7 +275,105 @@ def test_backward_gaussians2d_to_means2d():
     )
 
 
+def test_backward_means2d_to_means3d():
+    """Test backward mean 2D positions to mean 3D positions."""
+    name = "From_MEANS2D_To_MEANS3D"
+
+    img_w = 1920
+    img_h = 1080
+
+    fx, fy = 512.0, 512.0
+    cx, cy = img_w / 2.0, img_h / 2.0
+
+    cam_mats = torch.tensor(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        **KWARGS,
+    )
+    cam_mats = cam_mats[None].repeat(mN, 1, 1)
+
+    scale = 10.0
+
+    means2d = torch.rand(size=[mN, tK, 2], **KWARGS)
+    means2d[:, :, 0] = means2d[:, :, 0] * img_w
+    means2d[:, :, 1] = means2d[:, :, 1] * img_h
+
+    cam_zs = torch.rand(size=[mN, tK], **KWARGS) * scale + 1e-12
+    cam_xs = (means2d[:, :, 0] - cx) / fx * cam_zs
+    cam_ys = (means2d[:, :, 1] - cy) / fy * cam_zs
+
+    # Dim = [mN, tK, 4]
+    cam_means3d = torch.stack(
+        [cam_xs, cam_ys, cam_zs, torch.ones([mN, tK], **KWARGS)], dim=-1
+    )
+
+    view_mats = np.eye(4, dtype=np.float32)
+    view_mats = np.tile(view_mats[None], [mN, 1, 1])
+
+    view_quats = np.random.uniform(size=[mN, 4])
+    view_rot_mats = np.stack(
+        [ScipyRotation.from_quat(q).as_matrix() for q in view_quats], axis=0
+    )
+    view_mats[:, :3, :3] = view_rot_mats
+    view_mats[:, :3, 3] = np.random.normal(size=[mN, 3]).astype(np.float32) * scale
+    view_mats = torch.tensor(view_mats, **KWARGS)
+
+    # Dim = [mN, 4, 4] @ [mN, tK, 4] -> [mN, tK, 4]
+    means3d = torch.einsum("ijk,ilk->ilj", torch.linalg.inv(view_mats), cam_means3d)
+    means3d = means3d[:, :, :3] / (means3d[:, :, 3][..., None] + 1e-12)
+
+    view_idx = int(np.random.randint(0, mN))
+    means3d = means3d[view_idx]
+
+    _, mean2d_proj = project_points_3d_to_2d(
+        means3d, view_mats[view_idx][None], cam_mats[view_idx][None]
+    )
+
+    assert torch.allclose(mean2d_proj, means2d[view_idx], rtol=1e-3)
+
+    # Output: Dim = [mN, tK, 2]
+    # Input:  Dim = [tK, 3]
+    # Jacobian: Dim = [mN, tK, 2, 3]
+    jacob_auto = torch.autograd.functional.jacobian(
+        lambda x: project_points_3d_to_2d(
+            x, view_mats[view_idx][None], cam_mats[view_idx][None]
+        )[1],
+        means3d,
+    )
+    idxs = [i for i in range(tK)]
+    jacob_auto = jacob_auto[:, idxs, :, idxs, :]
+    jacob_auto = jacob_auto.permute([1, 0, 2, 3])
+
+    hess_auto = torch.autograd.functional.hessian(
+        lambda x: project_points_3d_to_2d(
+            x, view_mats[view_idx][None], cam_mats[view_idx][None]
+        )[1].sum(),
+        means3d,
+    )
+    hess_auto = hess_auto[idxs, :, idxs, :]
+
+    start = time.time()
+    jacob_ours, hess_ours = _backward_means2d_to_means3d(
+        view_mats[view_idx][None], cam_mats[view_idx][None], means3d
+    )
+    end = time.time()
+    assert torch.allclose(
+        jacob_auto, jacob_ours, rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+    hess_ours = hess_ours.sum(dim=[0, 2])
+    LOGGER.info(
+        f"Backward={name}, "
+        + f"Output=[{mN}, {tK}, 2], Input=[{tK}, 3], "
+        + f"Jacobian=[{mN}, {tK}, 2, 3], Hessian=[{mN}, {tK}, 2, 3, 3], "
+        + f"Elapsed={float(end - start):.6f} seconds."
+    )
+
+
 if __name__ == "__main__":
+    test_backward_means2d_to_means3d()
     test_backward_gaussians2d_to_means2d()
     test_backward_render_to_gaussians2d()
     test_backward_sh_colors_to_positions()

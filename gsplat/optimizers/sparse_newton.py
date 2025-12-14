@@ -466,3 +466,72 @@ def _backward_gaussians2d_to_means2d(
     # Dim = [mN, tH, tW, tK, 2, 2]
     hess = hess - term_1
     return jacob, hess
+
+
+def _backward_means2d_to_means3d(
+    view_mats: torch.Tensor, cam_mats: torch.Tensor, means3d: torch.Tensor
+):
+    """Backward from 2D mean position to 3D mean position."""
+
+    # Output: Dim = [mN, tK, 2]
+    # Input:  Dim = [tK, 3]
+    # Jacobian: Dim = [mN, tK, 2, 3]
+    proj_mats = torch.eye(4, dtype=cam_mats.dtype, device=cam_mats.device)
+    proj_mats = proj_mats[None].repeat(cam_mats.shape[0], 1, 1)
+    # Dim = [mN, 4, 4]
+    proj_mats[:, :3, :3] = cam_mats
+
+    # Dim = [mN, 4, 4]
+    pw = torch.einsum("ijk,ikl->ijl", proj_mats, view_mats)
+
+    pk = torch.concatenate(
+        [
+            means3d,
+            torch.ones(
+                size=[means3d.shape[0], 1], dtype=means3d.dtype, device=means3d.device
+            ),
+        ],
+        dim=-1,
+    )
+
+    # Dim = [mN, 4, 4] @ [tK, 4, 1] -> [mN, tK, 4, 1]
+    h = torch.einsum("ijk,lkm->iljm", pw, pk[:, :, None]).squeeze(-1)
+    # Dim = [mN, tK, 1]
+    hx = h[:, :, 0][:, :, None]
+    hy = h[:, :, 1][:, :, None]
+    hz = h[:, :, 2][:, :, None] + 1e-12
+
+    # Dim = [mN, 1, 3]
+    pw_0 = pw[:, 0, :3][:, None, :]
+    pw_1 = pw[:, 1, :3][:, None, :]
+    pw_2 = pw[:, 2, :3][:, None, :]
+
+    # Dim = [mN, tK, 2, 3]
+    jacob = torch.zeros(
+        size=[view_mats.shape[0], means3d.shape[0], 2, 3],
+        dtype=means3d.dtype,
+        device=means3d.device,
+    )
+    jacob[:, :, 0, :] = 1.0 / hz * (pw_0 - hx / hz * pw_2)
+    jacob[:, :, 1, :] = 1.0 / hz * (pw_1 - hy / hz * pw_2)
+
+    # Hessian: Dim = [mN, tK, 2, 3, 3]
+    hess = torch.zeros(
+        size=[view_mats.shape[0], means3d.shape[0], 2, 3, 3],
+        dtype=means3d.dtype,
+        device=means3d.device,
+    )
+    outer_fn = lambda x, y: torch.einsum(
+        "ijk,ikl->ijl", x.reshape([-1, 3, 1]), y.reshape([-1, 1, 3])
+    )
+    hess[:, :, 0, :, :] = -1.0 / (hz**2 + 1e-12)[:, :, :, None] * (
+        outer_fn(pw_2, pw_0) + outer_fn(pw_0, pw_2)
+    ) + 2.0 / (hz**3 + 1e-12)[:, :, :, None] * hx[:, :, :, None] * outer_fn(
+        pw_2, pw_2
+    )
+    hess[:, :, 1, :, :] = -1.0 / (hz**2 + 1e-12)[:, :, :, None] * (
+        outer_fn(pw_2, pw_1) + outer_fn(pw_1, pw_2)
+    ) + 2.0 / (hz**3 + 1e-12)[:, :, :, None] * hy[:, :, :, None] * outer_fn(
+        pw_2, pw_2
+    )
+    return jacob, hess
