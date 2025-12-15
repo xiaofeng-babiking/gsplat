@@ -202,6 +202,35 @@ def compute_pinhole_jacobian(
     return pin_jacob
 
 
+def compute_covariance_2d_inverse(
+    covars2d: torch.Tensor,  # Dim = [mN, tK, 2, 2]
+):
+    """Compute inverse of the 2D covariance matrix."""
+    # covars2d = [a, b, c, d]
+    # inverse covars2d = 1.0 / (a * d - b * c) * [d, -b, -c, a]
+    conics2d = torch.zeros(
+        size=list(covars2d.shape[:-2]) + [2, 2],
+        dtype=covars2d.dtype,
+        device=covars2d.device,
+    )
+
+    a = covars2d[:, :, 0, 0] + 0.3
+    b = covars2d[:, :, 0, 1]
+    c = covars2d[:, :, 1, 0]
+    d = covars2d[:, :, 1, 1] + 0.3
+    # Dim = [mN, tK]
+    det = a * d - b * c
+
+    conics2d[:, :, 0, 0] = d
+    conics2d[:, :, 0, 1] = -(b + c) / 2.0
+    conics2d[:, :, 1, 0] = -(b + c) / 2.0
+    conics2d[:, :, 1, 1] = a
+
+    # Dim = [mN, tK, 2, 2] * [mN, tK, 1, 1]
+    conics2d = conics2d / (det[:, :, None, None] + EPS)
+    return conics2d, det
+
+
 def project_gaussians_3d_to_2d(
     view_mats: torch.Tensor,
     cam_mats: torch.Tensor,
@@ -251,29 +280,8 @@ def project_gaussians_3d_to_2d(
         "ijkl,ijlm,ijmn->ijkn", pin_jacob, cam_covars3d, pin_jacob.transpose(-1, -2)
     )
 
-    # covars2d = [a, b, c, d]
-    # inverse covars2d = 1.0 / (a * d - b * c) * [d, -b, -c, a]
-    n_views = view_mats.shape[0]
-    n_splats = means3d.shape[0]
-    conics2d = torch.zeros(
-        size=[n_views, n_splats, 3],
-        dtype=covars2d.dtype,
-        device=covars2d.device,
-    )
-
-    a = covars2d[:, :, 0, 0] + 0.3
-    b = covars2d[:, :, 0, 1]
-    c = covars2d[:, :, 1, 0]
-    d = covars2d[:, :, 1, 1] + 0.3
-    # Dim = [mN, tK]
-    det = a * d - b * c
-
-    conics2d[:, :, 0] = d
-    conics2d[:, :, 1] = -(b + c) / 2.0
-    conics2d[:, :, 2] = a
-
-    # Dim = [mN, tK, 3] * [mN, tK, 1]
-    conics2d = conics2d / (det[:, :, None] + EPS)
+    conics2d, det = compute_covariance_2d_inverse(covars2d)
+    conics2d = conics2d[..., [0, 0, 1], [0, 1, 1]]
 
     extend = 3.3
     if opacities is not None:
