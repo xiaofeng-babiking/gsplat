@@ -23,6 +23,7 @@ from gsplat.optimizers.sparse_newton import (
     _backward_means2d_to_means3d,
     _backward_conics2d_to_covars2d,
     _backward_gaussians2d_to_covars2d,
+    _backward_covars2d_to_pinhole,
 )
 from gsplat.logger import create_logger
 
@@ -570,7 +571,7 @@ def test_backward_gaussians2d_to_covars2d(strict=True):
         .float()
         .mean()
     )
-    assert hess_ratio.item() > 0.60, f"{name} hessian wrong values!"
+    assert hess_ratio.item() > 0.72, f"{name} hessian wrong values!"
     LOGGER.info(
         f"Backward={name}, "
         + f"Output=[{mN}, {tH}, {tW}, {tK}], Input=[{mN}, {tK}, 2, 2], "
@@ -579,7 +580,64 @@ def test_backward_gaussians2d_to_covars2d(strict=True):
     )
 
 
+def test_backward_covars2d_to_pinhole():
+    """Test backward from 2D covariance matrices to pinhole projection jacobian matrices."""
+    name = f"From_COVARIANCES2D_To_Pinhole"
+
+    pin_jacob = torch.rand(size=[mN, tK, 2, 3], **KWARGS)
+    pin_jacob[:, :, 0, 1] = 0.0
+    pin_jacob[:, :, 1, 1] = 0.0
+    pin_jacob[:, :, 0, 2] = -1.0 * pin_jacob[:, :, 0, 2]
+    pin_jacob[:, :, 1, 2] = -1.0 * pin_jacob[:, :, 1, 2]
+
+    cam_covars3d = torch.rand(size=[mN, tK, 3, 3], **KWARGS) * 10.0
+    cam_covars3d[:, :, [0, 0, 1, 1, 2, 2], [1, 2, 0, 2, 0, 1]] = cam_covars3d[
+        :, :, [1, 2, 0, 2, 0, 1], [0, 0, 1, 1, 2, 2]
+    ]
+
+    forward_fn = lambda x: torch.einsum(
+        "ijkl,ijlm,ijmn->ijkn", x, cam_covars3d, x.transpose(-1, -2)
+    )
+
+    # Output: Dim = [mN, tK, 2, 2]
+    # Input: Dim = [mN, tK, 2, 3]
+    # Jacobian: Dim = [mN, tK, 2, 2, mN, tK, 2, 3] -> [mN, tK, 2, 2, 2, 3]
+    jacob_auto = torch.autograd.functional.jacobian(lambda x: forward_fn(x), pin_jacob)
+    ns, ks = torch.meshgrid(
+        [
+            torch.arange(mN, **KWARGS).int(),
+            torch.arange(tK, **KWARGS).int(),
+        ],
+        indexing="ij",
+    )
+    jacob_auto = jacob_auto[ns, ks, :, :, ns, ks, :, :]
+
+    # Hessian: Dim = [mN, tK, 2, 3, mN, tK, 2, 3] -> [mN, tK, 2, 3, 2, 3]
+    hess_auto = torch.autograd.functional.hessian(
+        lambda x: forward_fn(x).sum(), pin_jacob
+    )
+    hess_auto = hess_auto[ns, ks, :, :, ns, ks, :, :]
+
+    start = time.time()
+    jacob_ours, hess_ours = _backward_covars2d_to_pinhole(cam_covars3d, pin_jacob)
+    end = time.time()
+    hess_ours = hess_ours.sum(dim=[2, 3])
+    assert torch.allclose(
+        jacob_ours, jacob_auto, rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+    assert torch.allclose(
+        hess_ours, hess_auto, rtol=1e-3
+    ), f"{name} hessian wrong values!"
+    LOGGER.info(
+        f"Backward={name}, "
+        + f"Output=[{mN}, {tK}, 2, 2], Input=[{mN}, {tK}, 2, 3], "
+        + f"Jacobian=[{mN}, {tK}, 2, 2, 2, 3], Hessian=[{mN}, {tK}, 2, 2, 2, 3, 2, 3], "
+        + f"Elapsed={float(end - start):.6f} seconds."
+    )
+
+
 if __name__ == "__main__":
+    test_backward_covars2d_to_pinhole()
     test_backward_conics2d_to_covars2d()
     test_backward_gaussians2d_to_covars2d()
     test_backward_means2d_to_means3d()

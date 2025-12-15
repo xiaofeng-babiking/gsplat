@@ -658,3 +658,79 @@ def _backward_gaussians2d_to_covars2d(
         - 0.5 * gaussians2d[:, :, :, :, None, None, None, None] * term_1
     )
     return jacob, hess
+
+
+def _backward_covars2d_to_pinhole(
+    cam_covars3d: torch.Tensor,  # Dim = [mN, tK, 3, 3]
+    pin_jacob: torch.Tensor,  # Dim = [mN, tK, 2, 3]
+):
+    """Backward from 2D covariance matrices to pinhole jacobian."""
+    # Output: Dim = [mN, tK, 2, 2]
+    # Input:  Dim = [tK, 2, 3]
+    # Jacobian: Dim = [mN, tK, 2, 2, 2, 3]
+    jacob = torch.zeros(
+        size=list(cam_covars3d.shape[:-2]) + [2, 2, 2, 3],
+        dtype=cam_covars3d.dtype,
+        device=cam_covars3d.device,
+    )
+
+    # Dim = [mN, tK, 3]
+    pin_0 = pin_jacob[:, :, 0, :]
+    pin_1 = pin_jacob[:, :, 1, :]
+
+    # ∂Σ(0, 0) / ∂J(0) = J(0) @ (A + A.T)
+    # Dim = [mN, tK, 3] @ [mN, tK, 3, 3]
+    jacob[:, :, 0, 0, 0, :] = torch.einsum(
+        "nka,nkab->nkb", pin_0, (cam_covars3d + cam_covars3d.transpose(-1, -2))
+    )
+    # ∂Σ(0, 0) / ∂J(1) = 0
+    # ∂Σ(0, 1) / ∂J(0) = J(1) @ A.T
+    jacob[:, :, 0, 1, 0, :] = torch.einsum(
+        "nka,nkab->nkb", pin_1, cam_covars3d.transpose(-1, -2)
+    )
+    # ∂Σ(0, 1) / ∂J(1) = J(0) @ A
+    jacob[:, :, 0, 1, 1, :] = torch.einsum("nka,nkab->nkb", pin_0, cam_covars3d)
+    # ∂Σ(1, 0) / ∂J(0) = ∂(J(1) @ A @ J(0).T) / ∂J(0) = J(1) @ A, actually A = A.T
+    jacob[:, :, 1, 0, 0, :] = torch.einsum("nka,nkab->nkb", pin_1, cam_covars3d)
+    # ∂Σ(1, 0) / ∂J(1) = ∂(J(1) @ A @ J(0).T) / ∂J(1) = J(0) @ A.T, actually A = A.T
+    jacob[:, :, 1, 0, 1, :] = torch.einsum(
+        "nka,nkab->nkb", pin_0, cam_covars3d.transpose(-1, -2)
+    )
+    # ∂Σ(1, 1) / ∂J(0) = 0
+    # ∂Σ(1, 1) / ∂J(1) = J(1) @ (A + A.T)
+    jacob[:, :, 1, 1, 1, :] = torch.einsum(
+        "nka,nkab->nkb", pin_1, (cam_covars3d + cam_covars3d.transpose(-1, -2))
+    )
+
+    # Hessian: Dim = [mN, tK, 2, 2, 2, 3, 2, 3]
+    hess = torch.zeros(
+        size=list(cam_covars3d.shape[:-2]) + [2, 2, 2, 3, 2, 3],
+        dtype=cam_covars3d.dtype,
+        device=cam_covars3d.device,
+    )
+    # ∂²Σ(0, 0) / ∂J(0)² = A + A.T
+    hess[:, :, 0, 0, 0, :, 0, :] = cam_covars3d + cam_covars3d.transpose(-1, -2)
+    # ∂²Σ(0, 0) / ∂J(0)∂J(1) = 0
+    # ∂²Σ(0, 0) / ∂J(1)∂J(0) = 0
+    # ∂²Σ(0, 0) / ∂J(1)² = 0
+
+    # ∂²Σ(0, 1) / ∂J(0)² = 0
+    # ∂²Σ(0, 1) / ∂J(0)∂J(1) = A.T
+    hess[:, :, 0, 1, 0, :, 1, :] = cam_covars3d.transpose(-1, -2)
+    # ∂²Σ(0, 1) / ∂J(1)∂J(0) = A
+    hess[:, :, 0, 1, 1, :, 0, :] = cam_covars3d
+    # ∂²Σ(0, 1) / ∂J(1)² = 0
+
+    # ∂²Σ(1, 0) / ∂J(0)² = 0
+    # ∂²Σ(1, 0) / ∂J(0)∂J(1) = A
+    hess[:, :, 1, 0, 0, :, 1, :] = cam_covars3d
+    # ∂²Σ(1, 0) / ∂J(1)∂J(0) = A.T
+    hess[:, :, 1, 0, 1, :, 0, :] = cam_covars3d.transpose(-1, -2)
+    # ∂²Σ(1, 0) / ∂J(1)² = 0
+
+    # ∂²Σ(1, 1) / ∂J(0)² = 0
+    # ∂²Σ(1, 1) / ∂J(0)∂J(1) = 0
+    # ∂²Σ(1, 1) / ∂J(1)∂J(0) = 0
+    # ∂²Σ(1, 1) / ∂J(1)² = A + A.T
+    hess[:, :, 1, 1, 1, :, 1, :] = cam_covars3d + cam_covars3d.transpose(-1, -2)
+    return jacob, hess
