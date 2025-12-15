@@ -734,3 +734,103 @@ def _backward_covars2d_to_pinhole(
     # ∂²Σ(1, 1) / ∂J(1)² = A + A.T
     hess[:, :, 1, 1, 1, :, 1, :] = cam_covars3d + cam_covars3d.transpose(-1, -2)
     return jacob, hess
+
+
+def _backward_pinhole_to_means3d(
+    view_mats: torch.Tensor,
+    cam_mats: torch.Tensor,
+    means3d: torch.Tensor,
+):
+    """Backward from pinhole jacobian to 3D positions in the world frame.
+
+    J = [[fx / z,    0,    -fx * x / z^2],
+         [0,      fy / z,  -fy * y / z^2]]
+    where (x, y, z) is the 3D position in the camera frame.
+    """
+    # Dim = [mN, 1]
+    fx = cam_mats[:, 0, 0][:, None]
+    fy = cam_mats[:, 1, 1][:, None]
+
+    cam_means3d = (
+        torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
+        + view_mats[:, :3, 3][:, None, :]
+    )
+    # Dim = [mN, tK]
+    cam_xs = cam_means3d[:, :, 0]
+    cam_ys = cam_means3d[:, :, 1]
+    cam_zs = cam_means3d[:, :, 2]
+
+    # Dim = [mN, tK, 2, 3, 3]
+    batch_dims = [view_mats.shape[0], means3d.shape[0]]
+    # Output: Dim = [mN, tK, 2, 3]
+    # Input: Dim = [mN, tK, 3]
+    # Jacobian-Pinhole-CameraMeans3d: Dim = [mN, tK, 2, 3, 3]
+    jacob_p_to_c = torch.zeros(
+        size=batch_dims + [2, 3, 3],
+        dtype=means3d.dtype,
+        device=means3d.device,
+    )
+    eps = 1e-12
+    # ∂J(0, 0) / ∂X(2) = -fx / z²
+    jacob_p_to_c[:, :, 0, 0, 2] = -fx / (cam_zs**2 + eps)
+    # ∂J(0, 2) / ∂X(0) = -fx / z²
+    jacob_p_to_c[:, :, 0, 2, 0] = -fx / (cam_zs**2 + eps)
+    # ∂J(0, 2) / ∂X(2) = 2.0 * fx * x / z³
+    jacob_p_to_c[:, :, 0, 2, 2] = 2.0 * fx * cam_xs / (cam_zs**3 + eps)
+    # ∂J(1, 1) / ∂X(2) = -fy / z²
+    jacob_p_to_c[:, :, 1, 1, 2] = -fy / (cam_zs**2 + eps)
+    # ∂J(1, 2) / ∂X(1) = -fy / z²
+    jacob_p_to_c[:, :, 1, 2, 1] = -fy / (cam_zs**2 + eps)
+    # ∂J(1, 2) / ∂X(2) = 2.0 * fy * y / z³
+    jacob_p_to_c[:, :, 1, 2, 2] = 2.0 * fy * cam_ys / (cam_zs**3 + eps)
+
+    # Hessian-Pinhole-CameraMeans3d: Dim = [mN, tK, 2, 3, 3, 3]
+    hess_p_to_c = torch.zeros(
+        size=batch_dims + [2, 3, 3, 3],
+        dtype=means3d.dtype,
+        device=means3d.device,
+    )
+    # ∂J(0, 0) / ∂X(2) = -fx / z²
+    #   ∂²J(0, 0) / ∂X(2)∂X(2) = 2.0 * fx / z³
+    hess_p_to_c[:, :, 0, 0, 2, 2] = 2.0 * fx / (cam_zs**3 + eps)
+    # ∂J(0, 2) / ∂X(0) = -fx / z²
+    #   ∂²J(0, 2) / ∂X(0)∂X(2) = 2.0 * fx / z³
+    hess_p_to_c[:, :, 0, 2, 0, 2] = 2.0 * fx / (cam_zs**3 + eps)
+    # ∂J(0, 2) / ∂X(2) = 2.0 * fx * x / z³
+    #   ∂²J(0, 2) / ∂X(2)∂X(0) = 2.0 * fx / z³
+    #   ∂²J(0, 2) / ∂X(2)∂X(2) = -6.0 * fx * x / z⁴
+    hess_p_to_c[:, :, 0, 2, 2, 0] = 2.0 * fx / (cam_zs**3 + eps)
+    hess_p_to_c[:, :, 0, 2, 2, 2] = -6.0 * fx * cam_xs / (cam_zs**4 + eps)
+    # ∂J(1, 1) / ∂X(2) = -fy / z²
+    #   ∂²J(1, 1) / ∂X(2)∂X(2) = 2.0 * fy / z³
+    hess_p_to_c[:, :, 1, 1, 2, 2] = 2.0 * fy / (cam_zs**3 + eps)
+    # ∂J(1, 2) / ∂X(1) = -fy / z²
+    #   ∂²J(1, 2) / ∂X(1)∂X(2) = 2.0 * fy / z³
+    hess_p_to_c[:, :, 1, 2, 1, 2] = 2.0 * fy / (cam_zs**3 + eps)
+    # ∂J(1, 2) / ∂X(2) = 2.0 * fy * y / z³
+    #   ∂²J(1, 2) / ∂X(2)∂X(2) = -6.0 * fy * y / z⁴
+    #   ∂²J(1, 2) / ∂X(2)∂X(1) = 2.0 * fy / z³
+    hess_p_to_c[:, :, 1, 2, 2, 2] = -6.0 * fy * cam_ys / (cam_zs**4 + eps)
+    hess_p_to_c[:, :, 1, 2, 2, 1] = 2.0 * fy / (cam_zs**3 + eps)
+
+    # Output: Dim = [mN, tK, 3]
+    # Input: Dim = [mN, tK, 3]
+    # Jacobian-CameraMeans3d-WorldMeans3d: Dim = [mN, tK, 3, 3]
+    # X = R @ X' + t
+    # ∂X / ∂X' = R
+    # ∂²X / ∂X'² = 0
+    # ∂J / ∂X' = (∂J / ∂X) @ (∂X / ∂X')
+    # ∂²J / ∂X'²
+    #   = (∂X / ∂X').T @ (∂²J / ∂X²) @ (∂X / ∂X') + (∂J / ∂X) @ (∂²X / ∂X'²)
+    #   = (∂X / ∂X').T @ (∂²J / ∂X²) @ (∂X / ∂X')
+
+    # Dim = [mN, 3, 3]
+    rot_mats = view_mats[:, :3, :3]
+    # Dim = [mN, tK, 2, 3, 3] @ [mN, 3, 3] -> [mN, tK, 2, 3, 3]
+    jacob = torch.einsum("nkabc,ncd->nkabd", jacob_p_to_c, rot_mats)
+
+    # Dim = [mN, 3, 3ᵃ] @ [mN, tK, 2, 3, 3ᵃ, 3ᵇ] @ [mN, 3ᵇ, 3] -> [mN, tK, 2, 3, 3, 3]
+    hess = torch.einsum(
+        "ica,ikmnab,ibd->ikmncd", rot_mats.transpose(-1, -2), hess_p_to_c, rot_mats
+    )
+    return jacob, hess

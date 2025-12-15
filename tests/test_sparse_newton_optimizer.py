@@ -12,6 +12,7 @@ from gsplat.optimizers.torch_functions_forward import (
     project_points_3d_to_2d,
     compute_covariance_2d_inverse,
     get_tile_size,
+    compute_pinhole_jacobian,
 )
 from gsplat.optimizers.sparse_newton import (
     compute_blend_alphas,
@@ -24,6 +25,7 @@ from gsplat.optimizers.sparse_newton import (
     _backward_conics2d_to_covars2d,
     _backward_gaussians2d_to_covars2d,
     _backward_covars2d_to_pinhole,
+    _backward_pinhole_to_means3d,
 )
 from gsplat.logger import create_logger
 
@@ -421,7 +423,7 @@ def test_backward_conics2d_to_covars2d(strict=False):
         | torch.isnan(jacob_ours)
         | torch.isinf(jacob_ours)
     )
-    torch.allclose(
+    assert torch.allclose(
         jacob_auto[jacob_mask], jacob_ours[jacob_mask], rtol=1e-3
     ), f"{name} jacobian wrong values!"
 
@@ -431,7 +433,7 @@ def test_backward_conics2d_to_covars2d(strict=False):
         | torch.isnan(hess_ours)
         | torch.isinf(hess_ours)
     )
-    torch.allclose(
+    assert torch.allclose(
         hess_auto[hess_mask], hess_ours[hess_mask], rtol=1e-3
     ), f"{name} hessian wrong values!"
     LOGGER.info(
@@ -636,7 +638,99 @@ def test_backward_covars2d_to_pinhole():
     )
 
 
+def test_backward_pinhole_to_means3d():
+    """Test backward from pinhole projection jacobian matrices to 3D positions in the world frame."""
+    name = f"From_Pinhole_To_Means3D"
+
+    def _forward_means3d_to_pinhole(_view_mats, _cam_mats, _means3d):
+        _cam_means3d = (
+            torch.sum(_view_mats[:, None, :3, :3] * _means3d[None, :, None, :], dim=-1)
+            + _view_mats[:, :3, 3][:, None, :]
+        )
+
+        _pin_jacob = compute_pinhole_jacobian(_cam_mats, _cam_means3d, img_w, img_h)
+        return _pin_jacob
+
+    img_w = 1920
+    img_h = 1080
+
+    fx, fy = 512.0, 512.0
+    cx, cy = img_w / 2.0, img_h / 2.0
+
+    cam_mats = torch.tensor(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        **KWARGS,
+    )
+    cam_mats = cam_mats[None].repeat(mN, 1, 1)
+
+    scale = 10.0
+
+    means2d = torch.rand(size=[mN, tK, 2], **KWARGS)
+    means2d[:, :, 0] = means2d[:, :, 0] * img_w
+    means2d[:, :, 1] = means2d[:, :, 1] * img_h
+
+    cam_zs = torch.rand(size=[mN, tK], **KWARGS) * scale + 1e-12
+    cam_xs = (means2d[:, :, 0] - cx) / fx * cam_zs
+    cam_ys = (means2d[:, :, 1] - cy) / fy * cam_zs
+
+    # Dim = [mN, tK, 4]
+    cam_means3d = torch.stack(
+        [cam_xs, cam_ys, cam_zs, torch.ones([mN, tK], **KWARGS)], dim=-1
+    )
+
+    view_mats = np.eye(4, dtype=np.float32)
+    view_mats = np.tile(view_mats[None], [mN, 1, 1])
+
+    view_quats = np.random.uniform(size=[mN, 4])
+    view_rot_mats = np.stack(
+        [ScipyRotation.from_quat(q).as_matrix() for q in view_quats], axis=0
+    )
+    view_mats[:, :3, :3] = view_rot_mats
+    view_mats[:, :3, 3] = np.random.normal(size=[mN, 3]).astype(np.float32) * scale
+    view_mats = torch.tensor(view_mats, **KWARGS)
+
+    # Dim = [mN, 4, 4] @ [mN, tK, 4] -> [mN, tK, 4]
+    means3d = torch.einsum("ijk,ilk->ilj", torch.linalg.inv(view_mats), cam_means3d)
+    means3d = means3d[:, :, :3] / (means3d[:, :, 3][..., None] + 1e-12)
+
+    view_idx = int(np.random.randint(0, mN))
+    means3d = means3d[view_idx]
+    cam_mats = cam_mats[view_idx][None]
+    view_mats = view_mats[view_idx][None]
+
+    # Output: Dim = [mN, tK, 2, 3]
+    # Input: Dim = [tK, 3]
+    # Jacobian: Dim = [mN, tK, 2, 3, tK, 3] -> [mN, tK, 2, 3, 3]
+    jacob_auto = torch.autograd.functional.jacobian(
+        lambda x: _forward_means3d_to_pinhole(view_mats, cam_mats, x), means3d
+    )
+    idxs = [i for i in range(tK)]
+    jacob_auto = jacob_auto[:, idxs, :, :, idxs, :]
+    jacob_auto = jacob_auto.permute([1, 0, 2, 3, 4])
+
+    # Hessian: Dim = [tK, 3, tK, 3] -> [tK, 3, 3]
+    hess_auto = torch.autograd.functional.hessian(
+        lambda x: _forward_means3d_to_pinhole(view_mats, cam_mats, x).sum(), means3d
+    )
+    hess_auto = hess_auto[idxs, :, idxs, :]
+
+    jacob_ours, hess_ours = _backward_pinhole_to_means3d(view_mats, cam_mats, means3d)
+    # Dim = [mN, tK, 2, 3, 3, 3] -> [tK, 3, 3]
+    hess_ours = hess_ours.sum(dim=[0, 2, 3])
+    assert torch.allclose(
+        jacob_ours, jacob_auto, rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+    assert torch.allclose(
+        hess_ours, hess_auto, rtol=1e-3
+    ), f"{name} jacobian wrong values!"
+
+
 if __name__ == "__main__":
+    test_backward_pinhole_to_means3d()
     test_backward_covars2d_to_pinhole()
     test_backward_conics2d_to_covars2d()
     test_backward_gaussians2d_to_covars2d()
