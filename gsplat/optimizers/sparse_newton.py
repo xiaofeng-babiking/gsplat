@@ -570,8 +570,8 @@ def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
         device=conics2d.device,
     )
     hess[..., i, j, p, l, g, h] = (
-        conics2d_mat[..., g, i] * conics2d_mat[..., p, h] * conics2d_mat[..., j, l]
-        + conics2d_mat[..., p, i] * conics2d_mat[..., g, l] * conics2d_mat[..., j, h]
+        conics2d_mat[..., i, g] * conics2d_mat[..., h, p] * conics2d_mat[..., l, j]
+        + conics2d_mat[..., i, p] * conics2d_mat[..., l, g] * conics2d_mat[..., h, j]
     )
     return jacob, hess
 
