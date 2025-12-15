@@ -550,8 +550,12 @@ def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
         ],
         indexing="ij",
     )
-
-    jacob = -conics2d_mat[..., p, i] * conics2d_mat[..., j, l]
+    jacob = torch.zeros(
+        size=[*conics2d.shape[:-1], 2, 2, 2, 2],
+        dtype=conics2d.dtype,
+        device=conics2d.device,
+    )
+    jacob[..., i, j, p, l] = -conics2d_mat[..., i, p] * conics2d_mat[..., l, j]
 
     i, j, p, l, g, h = torch.meshgrid(
         [
@@ -560,7 +564,12 @@ def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
         ],
         indexing="ij",
     )
-    hess = (
+    hess = torch.zeros(
+        size=[*conics2d.shape[:-1], 2, 2, 2, 2, 2, 2],
+        dtype=conics2d.dtype,
+        device=conics2d.device,
+    )
+    hess[..., i, j, p, l, g, h] = (
         conics2d_mat[..., g, i] * conics2d_mat[..., p, h] * conics2d_mat[..., j, l]
         + conics2d_mat[..., p, i] * conics2d_mat[..., g, l] * conics2d_mat[..., j, h]
     )
@@ -574,7 +583,7 @@ def _backward_gaussians2d_to_covars2d(
     tile_size_h: int,
     img_w: int,
     img_h: int,
-    gaussian2d: torch.Tensor,
+    gaussians2d: torch.Tensor,
     means2d: torch.Tensor,
     conics2d: torch.Tensor,
 ):
@@ -617,6 +626,7 @@ def _backward_gaussians2d_to_covars2d(
     tile_pixels = means2d[:, None, None, :, :] - tile_pixels[None, :, :, None, :]
 
     # jacobian conics2d to covars2d: Dim = [mN, tK, 2, 2, 2, 2]
+    # hessian conics2d to covars2d: Dim = [mN, tK, 2, 2, 2, 2, 2, 2]
     jacob_conics2d, hess_conics2d = _backward_conics2d_to_covars2d(conics2d)
 
     # Dim = [mN, tH, tW, tK, 2] @  [mN, tK, 2, 2, 2, 2] @ [mN, tH, tW, tK, 2]
@@ -625,7 +635,26 @@ def _backward_gaussians2d_to_covars2d(
         "ihwkp,ikmnpq,ihwkq->ihwkmn", tile_pixels, jacob_conics2d, tile_pixels
     )
     # Dim = [mN, tH, tW, tK] * [mN, tH, tW, tK, 2, 2]
-    jacob = -0.5 * gaussian2d[:, :, :, :, None, None] * term_0
+    jacob = -0.5 * gaussians2d[:, :, :, :, None, None] * term_0
 
-    hess = None
+    # Dim = [mN, tH, tW, tK, 2, 2] -> [mN, tH, tW, tK, 2, 2, 2, 2]
+    batch_dims = list(term_0.shape[:-2])
+    term_0_sq = torch.einsum(
+        "...ij,...jk->...ik",
+        term_0.reshape(batch_dims + [4, 1]),
+        term_0.reshape(batch_dims + [1, 4]),
+    )
+    term_0_sq = term_0_sq.reshape(batch_dims + [2, 2, 2, 2])
+
+    # Dim = [mN, tH, tW, tK, 2ᶜ] @ [mN, tK, 2ᵃ, 2ᵇ, 2ᶜ, 2ᵈ, 2ᵐ, 2ⁿ] @ [mN, tH, tW, tK, 2ᵈ]
+    #    -> [mN, tH, tW, tK, 2ᵃ, 2ᵇ, 2ᵐ, 2ⁿ]
+    term_1 = torch.einsum(
+        "ihwkc,ikabcdmn,ihwkd->ihwkabmn", tile_pixels, hess_conics2d, tile_pixels
+    )
+
+    # Dim = [mN, tH, tW, tK, 1, 1, 1, 1] * [mN, tH, tW, tK, 2ᵃ, 2ᵇ, 2ᵍ, 2ʰ]
+    hess = (
+        0.25 * gaussians2d[:, :, :, :, None, None, None, None] * term_0_sq
+        - 0.5 * gaussians2d[:, :, :, :, None, None, None, None] * term_1
+    )
     return jacob, hess
