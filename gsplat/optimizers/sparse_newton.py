@@ -539,15 +539,9 @@ def _backward_means2d_to_means3d(
 
 def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
     """Backward from inverse covariance matrices to covariance matrices."""
-    conics2d_mat = torch.zeros(
-        size=list(conics2d.shape[:-1]) + [2, 2],
-        dtype=conics2d.dtype,
-        device=conics2d.device,
+    conics2d_mat = conics2d[..., [0, 1, 1, 2]].reshape(
+        list(conics2d.shape[:-1]) + [2, 2]
     )
-    conics2d_mat[..., 0, 0] = conics2d[..., 0]
-    conics2d_mat[..., 0, 1] = conics2d[..., 1]
-    conics2d_mat[..., 1, 0] = conics2d[..., 1]
-    conics2d_mat[..., 1, 1] = conics2d[..., 2]
 
     i, j, p, l = torch.meshgrid(
         [
@@ -570,4 +564,68 @@ def _backward_conics2d_to_covars2d(conics2d: torch.Tensor):
         conics2d_mat[..., g, i] * conics2d_mat[..., p, h] * conics2d_mat[..., j, l]
         + conics2d_mat[..., p, i] * conics2d_mat[..., g, l] * conics2d_mat[..., j, h]
     )
+    return jacob, hess
+
+
+def _backward_gaussians2d_to_covars2d(
+    tile_x: int,
+    tile_y: int,
+    tile_size_w: int,
+    tile_size_h: int,
+    img_w: int,
+    img_h: int,
+    gaussian2d: torch.Tensor,
+    means2d: torch.Tensor,
+    conics2d: torch.Tensor,
+):
+    """Backward from Gaussian 2D weights to 2D covariance matrices.
+
+    Args:
+        [1] tile_x: The x coordinate of the tile, int.
+        [2] tile_y: The y coordinate of the tile, int.
+        [3] tile_size_w: The width of the tile, int.
+        [4] tile_size_h: The height of the tile, int.
+        [5] gaussian2d: The Gaussian 2D weights, torch.Tensor.
+        [6] means2d: The 2D mean positions, torch.Tensor.
+        [7] conics2d: The 2D inverse of covariance matrices, torch.Tensor.
+
+    Returns:
+        [1] jacob: The Jacobian of the backward pass, torch.Tensor.
+            Output: Dim = [mN, tH, tW, tK]
+            Input:  Dim = [mN, tK, 2, 2]
+            Jacobian: Dim = [mN, tH, tW, tK, 2, 2]
+        [2] hess: The Hessian of the backward pass, torch.Tensor.
+            Output: Dim = [mN, tH, tW, tK]
+            Input:  Dim = [mN, tK, 2, 2]
+            Hessian: Dim = [mN, tH, tW, tK, 2, 2, 2, 2]
+    """
+    tile_xmin, tile_ymin, crop_w, crop_h = get_tile_size(
+        tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h
+    )
+
+    tile_ys, tile_xs = torch.meshgrid(
+        torch.arange(crop_h, dtype=means2d.dtype, device=means2d.device),
+        torch.arange(crop_w, dtype=means2d.dtype, device=means2d.device),
+        indexing="ij",
+    )
+
+    tile_xs = tile_xs + tile_xmin + 0.5
+    tile_ys = tile_ys + tile_ymin + 0.5
+    # Dim = [tH, tW, 2]
+    tile_pixels = torch.stack([tile_xs, tile_ys], dim=-1)
+    # Dim = [mN, 1, 1, tK, 2] - [1, tH, tW, 1, 2] -> [mN, tH, tW, tK, 2]
+    tile_pixels = means2d[:, None, None, :, :] - tile_pixels[None, :, :, None, :]
+
+    # jacobian conics2d to covars2d: Dim = [mN, tK, 2, 2, 2, 2]
+    jacob_conics2d, hess_conics2d = _backward_conics2d_to_covars2d(conics2d)
+
+    # Dim = [mN, tH, tW, tK, 2] @  [mN, tK, 2, 2, 2, 2] @ [mN, tH, tW, tK, 2]
+    #   -> [mN, tH, tW, tK, 2, 2]
+    term_0 = torch.einsum(
+        "ihwkp,ikmnpq,ihwkq->ihwkmn", tile_pixels, jacob_conics2d, tile_pixels
+    )
+    # Dim = [mN, tH, tW, tK] * [mN, tH, tW, tK, 2, 2]
+    jacob = -0.5 * gaussian2d[:, :, :, :, None, None] * term_0
+
+    hess = None
     return jacob, hess
