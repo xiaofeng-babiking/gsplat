@@ -42,9 +42,10 @@ def get_tile_size(
     return tile_xmin, tile_ymin, crop_w, crop_h
 
 
-def compute_blend_alphas(alphas: torch.Tensor):
+def compute_blend_alphas(alphas: torch.Tensor, clamped: bool = True):
     """Compute blended alphas by cumprod."""
-    alphas = torch.clamp_max(alphas, 0.9999)
+    if clamped:
+        alphas = torch.clamp_max(alphas, 0.9999)
 
     # Dim = [mN, tH, tW, tK]
     blend_alphas = torch.cumprod(1.0 - alphas, dim=-1)
@@ -56,6 +57,7 @@ def compute_blend_alphas(alphas: torch.Tensor):
 def _backward_render_to_sh_colors(
     num_chs: int,
     alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+    blend_alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
     masks: Optional[torch.Tensor] = None,  # Dim = [mN, tK]
 ):
     """Backward pass of rendered pixels w.r.t spherical harmonics colors.
@@ -78,11 +80,6 @@ def _backward_render_to_sh_colors(
 
         ∂²(RGB) / ∂(SH(k))² = 0.0
     """
-    alphas = torch.clamp_max(alphas, 0.9999)
-
-    # Dim = [mN, tH, tW, tK]
-    alphas, blend_alphas = compute_blend_alphas(alphas)
-
     # Output:  Dim = [mN, tH, tW, mC]
     # Input:   Dim = [tK, mC]
     # Jacobian Dim = [mN, tH, tW, mC, tK, mC] -> [mN, tH, tW, tK, mC]
@@ -834,3 +831,16 @@ def _backward_pinhole_to_means3d(
         "ica,ikmnab,ibd->ikmncd", rot_mats.transpose(-1, -2), hess_p_to_c, rot_mats
     )
     return jacob, hess
+
+
+def _backward_render_to_means3d():
+    """Backward from render RGB to 3D positions in the world frame.
+    Symbols:
+        c:  pixel-wise tile-level render RGB, Dim = [mN, tH, tW, 3]
+        ck: splat-wise SH RGB, Dim = [mN, tK, 3]
+        pk: splat-wise 3D centers in the world frame, Dim = [tK, 3]
+        gk: splat-wise tile-level 2D gaussian weights, Dim = [mN, tK, tH, tW]
+        uk: i.e. πk, splat-wise 2D centers in the image plane, Dim = [mN, tK, 2]
+        sk: i.e. Σk, splat-wise 2D covariance matrices in the image plane, Dim = [mN, tK, 2, 2]
+    """
+    jacob_c_ck, hess_c_ck = _backward_render_to_sh_colors(num_chs, alphas, masks)

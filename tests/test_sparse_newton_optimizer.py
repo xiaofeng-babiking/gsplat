@@ -48,6 +48,7 @@ def test_backward_render_to_sh_colors():
     name = "From_RENDER_To_SH_COLORS"
 
     alphas = torch.randn(size=[mN, tH, tW, tK], **KWARGS)
+    alphas, blend_alphas = compute_blend_alphas(alphas)
 
     sh_colors = torch.randn(size=[mN, tK, mC], **KWARGS)
 
@@ -73,6 +74,7 @@ def test_backward_render_to_sh_colors():
     jacob_ours, _ = _backward_render_to_sh_colors(
         num_chs=mC,
         alphas=alphas,
+        blend_alphas=blend_alphas,
         masks=masks,
     )
     end = time.time()
