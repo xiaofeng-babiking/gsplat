@@ -629,7 +629,7 @@ def _backward_gaussians2d_to_covars2d(
     # Dim = [mN, tH, tW, tK, 2] @  [mN, tK, 2, 2, 2, 2] @ [mN, tH, tW, tK, 2]
     #   -> [mN, tH, tW, tK, 2, 2]
     term_0 = torch.einsum(
-        "ihwkp,ikmnpq,ihwkq->ihwkmn", tile_pixels, jacob_conics2d, tile_pixels
+        "nhwka,nkabcd,nhwkb->nhwkcd", tile_pixels, jacob_conics2d, tile_pixels
     )
     # Dim = [mN, tH, tW, tK] * [mN, tH, tW, tK, 2, 2]
     jacob = -0.5 * gaussians2d[:, :, :, :, None, None] * term_0
@@ -643,10 +643,10 @@ def _backward_gaussians2d_to_covars2d(
     )
     term_0_sq = term_0_sq.reshape(batch_dims + [2, 2, 2, 2])
 
-    # Dim = [mN, tH, tW, tK, 2ᶜ] @ [mN, tK, 2ᵃ, 2ᵇ, 2ᶜ, 2ᵈ, 2ᵐ, 2ⁿ] @ [mN, tH, tW, tK, 2ᵈ]
-    #    -> [mN, tH, tW, tK, 2ᵃ, 2ᵇ, 2ᵐ, 2ⁿ]
+    # Dim = [mN, tH, tW, tK, 2ᵃ] @ [mN, tK, 2ᵃ, 2ᵇ, 2, 2, 2, 2] @ [mN, tH, tW, tK, 2ᵇ]
+    #    -> [mN, tH, tW, tK, 2, 2, 2, 2]
     term_1 = torch.einsum(
-        "ihwkc,ikabcdmn,ihwkd->ihwkabmn", tile_pixels, hess_conics2d, tile_pixels
+        "nhwka,nkabpquv,nhwkb->nhwkpquv", tile_pixels, hess_conics2d, tile_pixels
     )
 
     # Dim = [mN, tH, tW, tK, 1, 1, 1, 1] * [mN, tH, tW, tK, 2ᵃ, 2ᵇ, 2ᵍ, 2ʰ]
@@ -831,16 +831,3 @@ def _backward_pinhole_to_means3d(
         "ica,ikmnab,ibd->ikmncd", rot_mats.transpose(-1, -2), hess_p_to_c, rot_mats
     )
     return jacob, hess
-
-
-def _backward_render_to_means3d():
-    """Backward from render RGB to 3D positions in the world frame.
-    Symbols:
-        c:  pixel-wise tile-level render RGB, Dim = [mN, tH, tW, 3]
-        ck: splat-wise SH RGB, Dim = [mN, tK, 3]
-        pk: splat-wise 3D centers in the world frame, Dim = [tK, 3]
-        gk: splat-wise tile-level 2D gaussian weights, Dim = [mN, tK, tH, tW]
-        uk: i.e. πk, splat-wise 2D centers in the image plane, Dim = [mN, tK, 2]
-        sk: i.e. Σk, splat-wise 2D covariance matrices in the image plane, Dim = [mN, tK, 2, 2]
-    """
-    jacob_c_ck, hess_c_ck = _backward_render_to_sh_colors(num_chs, alphas, masks)
