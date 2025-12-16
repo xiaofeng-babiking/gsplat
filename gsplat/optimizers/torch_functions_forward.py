@@ -531,7 +531,7 @@ def rasterize_to_pixels_tile_forward(
 
     # Dim = [mN, tK]
     if masks is None:
-        masks = (radii > 0).all(dim=-1).float()
+        masks = (radii > 0).all(dim=-1)
 
     # Dim = [mN, tH, tW, tK]
     gausses2d, tile_pixels, tile_bbox = compute_gaussian_weights_2d_tile(

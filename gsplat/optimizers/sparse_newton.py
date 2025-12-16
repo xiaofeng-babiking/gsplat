@@ -1,6 +1,6 @@
 import math
 import torch
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Any
 from sympy import symbols, simplify, diff, lambdify
 
 SPHERICAL_HARMONICS_CONSTANTS = [
@@ -831,3 +831,369 @@ def _backward_pinhole_to_means3d(
         "ica,ikmnab,ibd->ikmncd", rot_mats.transpose(-1, -2), hess_p_to_c, rot_mats
     )
     return jacob, hess
+
+
+def _backward_render_to_means3d(
+    num_chs: int,
+    tile_x: int,
+    tile_y: int,
+    tile_size_w: int,
+    tile_size_h: int,
+    img_w: int,
+    img_h: int,
+    view_mats: torch.Tensor,  # Dim = [mN, 4, 4]
+    cam_mats: torch.Tensor,  # Dim = [mN, 3, 3]
+    means3d: torch.Tensor,  # Dim = [tK, 3]
+    opacities: torch.Tensor,  # Dim = [tK]
+    sh_coeffs: torch.Tensor,  # Dim = [tK, (L + 1)^2, 3]
+    sh_deriv_funcs: List[Dict[str, Callable]],  # Dim = [(L + 1)^2]
+    alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+    blend_alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+    sh_colors: torch.Tensor,  # Dim = [mN, tK, 3]
+    gaussians2d: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+    means2d: torch.Tensor,  # Dim = [mN, tK, 2]
+    conics2d: torch.Tensor,  # Dim = [mN, tK, 3]
+    cam_covars3d: torch.Tensor,  # Dim = [mN, tK, 3, 3]
+    pin_jacob: torch.Tensor,  # Dim = [mN, tK, 2, 3]
+    tile_pixels: torch.Tensor,  # Dim = [mN, tH, tW, 2]
+    masks: Optional[torch.Tensor] = None,  # Dim = [mN, tK]
+):
+    """Backward from render RGB to 3D positions in the world frame.
+    Symbols:
+        c:  pixel-wise tile-level render RGB, Dim = [mN, tH, tW, mC]
+        ck: splat-wise SH RGB, Dim = [mN, tK, mC]
+        pk: splat-wise 3D centers in the world frame, Dim = [tK, 3]
+        gk: splat-wise tile-level 2D gaussian weights, Dim = [mN, tK, tH, tW]
+        uk: i.e. πk, splat-wise 2D centers in the image plane, Dim = [mN, tK, 2]
+        sk: i.e. Σk, splat-wise 2D covariance matrices in the image plane, Dim = [mN, tK, 2, 2]
+        jk: splat-wise pinhole-projection 2x3 jacobian-approximate matrices, Dim = [mN, tK, 2, 3]
+    """
+    # c: Dim = [mN, tH, tW, mC]
+    # ck: Dim = [mN, tK, mC]
+    # j_c_ck: Dim = [mN, tH, tW, tK, mC, mC] -> RGB diagonal -> [mN, tH, tW, tK, mC]
+    j_c_ck, _ = _backward_render_to_sh_colors(num_chs, alphas, blend_alphas, masks=None)
+
+    # ck: Dim = [mN, tK, mC]
+    # pk: Dim = [tK, 3]
+    # j_ck_pk: Dim = [mN, tK, mC, 3]
+    # h_ck_pk: Dim = [mN, tK, mC, 3, 3]
+    j_ck_pk, h_ck_pk = _backward_sh_colors_to_positions(
+        means3d,
+        view_mats,
+        sh_coeffs,
+        sh_deriv_funcs,
+        None,
+        masks=None,
+    )
+
+    # c: Dim = [mN, tH, tW, mC]
+    # gk: Dim = [mN, tH, tW, tK]
+    # j_c_gk: Dim = [mN, tH, tW, tK, mC]
+    j_c_gk, _ = _backward_render_to_gaussians2d(
+        sh_colors, opacities, alphas, blend_alphas, masks=None
+    )
+
+    # gk: Dim = [mN, tH, tW, tK]
+    # uk: Dim = [mN, tK, 2]
+    # j_gk_uk: Dim = [mN, tH, tW, tK, 2]
+    # h_gk_uk: Dim = [mN, tH, tW, tK, 2, 2]
+    j_gk_uk, h_gk_uk = _backward_gaussians2d_to_means2d(
+        tile_x,
+        tile_y,
+        tile_size_w,
+        tile_size_h,
+        img_w,
+        img_h,
+        gaussians2d,
+        means2d,
+        conics2d,
+    )
+
+    # uk: Dim = [mN, tK, 2]
+    # pk: Dim = [tK, 3]
+    # j_uk_pk: Dim = [mN, tK, 2, 3]
+    # h_uk_pk: Dim = [mN, tK, 2, 3, 3]
+    j_uk_pk, h_uk_pk = _backward_means2d_to_means3d(view_mats, cam_mats, means3d)
+
+    # gk: Dim = [mN, tH, tW, tK]
+    # sk: Dim = [mN, tK, 2, 2]
+    # j_gk_sk: Dim = [mN, tH, tW, tK, 2, 2]
+    # h_gk_sk: Dim = [mN, tH, tW, tK, 2, 2, 2, 2]
+    j_gk_sk, h_gk_sk = _backward_gaussians2d_to_covars2d(
+        tile_x,
+        tile_y,
+        tile_size_w,
+        tile_size_h,
+        img_w,
+        img_h,
+        gaussians2d,
+        means2d,
+        conics2d,
+    )
+
+    # sk: Dim = [mN, tK, 2, 2]
+    # jk: Dim = [mN, tK, 2, 3]
+    # j_sk_jk: Dim = [mN, tK, 2, 2, 2, 3]
+    # h_sk_jk: Dim = [mN, tK, 2, 2, 2, 3, 2, 3]
+    j_sk_jk, h_sk_jk = _backward_covars2d_to_pinhole(cam_covars3d, pin_jacob)
+
+    # jk: Dim = [mN, tK, 2, 3]
+    # pk: Dim = [tK, 3]
+    # j_jk_pk: Dim = [mN, tK, 2, 3, 3]
+    # h_jk_pk: Dim = [mN, tK, 2, 3, 3, 3]
+    j_jk_pk, h_jk_pk = _backward_pinhole_to_means3d(view_mats, cam_mats, means3d)
+    # j_sk_pk
+    #   = j_sk_jk @ j_jk_pk
+    #   -> [mN, tK, 2, 2, 2, 3] @ [mN, tK, 2, 3, 3] -> [mN, tK, 2, 2, 3]
+    j_sk_pk = torch.einsum("nkabpq,nkpqc->nkabc", j_sk_jk, j_jk_pk)
+
+    # h_sk_pk
+    #   = j_jk_pk.T @ h_sk_jk @ j_jk_pk + j_sk_jk @ h_jk_pk
+    # h_sk_pk_0
+    #   = j_jk_pk.T @ h_sk_jk @ j_jk_pk
+    #   -> [mN, tK, 2ᵃ, 3ᵇ, 3] @ [mN, tK, 2, 2, 2ᵃ, 3ᵇ, 2ᶜ, 3ᵈ] @ [mN, tK, 2ᶜ, 3ᵈ, 3]
+    #   -> [mN, tK, 2, 2, 3, 3]
+    h_sk_pk_0 = torch.einsum("nkabe,nkpqabcd,nkcdf->nkpqef", j_jk_pk, h_sk_jk, j_jk_pk)
+    # h_sk_pk_1
+    #   = j_sk_jk @ h_jk_pk
+    #   -> [mN, tK, 2, 2, 2, 3] @ [mN, tK, 2, 3, 3, 3]
+    h_sk_pk_1 = torch.einsum("nkpqab,nkabcd->nkpqcd", j_sk_jk, h_jk_pk)
+    h_sk_pk = h_sk_pk_0 + h_sk_pk_1
+
+    # ∂G / ∂π = -G * Σ^-1 @ (π - x) where x is the pixel coordinates within a tile
+    # ∂G / ∂π∂Σ
+    #   = -(∂G / ∂Σ) * Σ^-1 @ (π - x) - G * (∂(Σ^-1) / ∂Σ) @ (π - x)
+    # h_gk_uk_sk = -j_gk_sk @ conics2d @ (means2d - x) - j_gk_uk @ j_sk_inv_sk
+    # h_gk_uk_sk_0
+    #   = -j_gk_sk @ conics2d @ (means2d - x)
+    #   = -j_gk_sk @ conics2d @ tile_pixels
+    #   -> [mN, tH, tW, tK, 2ˢ, 2ˢ] * [mN, tK, 2ᵘ, 2] @ [mN, tK, 2]
+    #   -> [mN, tH, tW, tK, 2ᵘ, 2ˢ, 2ˢ]
+    h_gk_uk_sk_0 = -torch.einsum(
+        "nhwkcd,nkab,nkb->nhwkacd", j_gk_sk, conics2d, tile_pixels
+    )
+    # sk_inv: Dim = [mN, tK, 2, 2]
+    # sk: Dim = [mN, tK, 2, 2]
+    # j_sk_inv_sk: Dim = [mN, tK, 2ᵃ, 2ᵇ, 2, 2]
+    j_sk_inv_sk, _ = _backward_conics2d_to_covars2d(conics2d)
+    # h_gk_uk_sk_1
+    #   = -gaussians2d * tile_pixels.T @ j_sk_inv_sk
+    #   -> [mN, tH, tW, tK] * [mN, tK, 2ᵃ, 2ᵇ, 2, 2] @ [mN, tK, 2ᵇ]
+    h_gk_uk_sk_1 = -torch.einsum(
+        "nhwk,nkabcd,nkb->nhwkacd", gaussians2d, j_sk_inv_sk, tile_pixels
+    )
+    h_gk_uk_sk = h_gk_uk_sk_0 + h_gk_uk_sk_1
+
+    # jacob
+    #   = j_c_ck @ j_ck_pk + j_c_gk @ (j_gk_uk @ j_uk_pk + j_gk_sk @ j_sk_pk)
+    # jacob_0
+    #   = j_c_ck @ j_ck_pk
+    #   -> [mN, tH, tW, tK, mC, 1] * [mN, 1, 1, tK, mC, 3]
+    #   -> [mN, tH, tW, tK, mC, 3]
+    jacob_0 = j_c_ck[:, :, :, :, :, None] * j_ck_pk[:, None, None, :, :, :]
+    # jacob_1_0
+    #   = j_gk_uk @ j_uk_pk
+    #   -> [mN, tH, tW, tK, 2] @ [mN, tK, 2, 3]
+    jacob_1_0 = torch.einsum("nhwku,nkux->nhwkx", j_gk_uk, j_uk_pk)
+    # jacob_1_1
+    #   = j_gk_sk @ j_sk_pk
+    #   -> [mN, tH, tW, tK, 2, 2] @ [mN, tK, 2, 2, 3]
+    jacob_1_1 = torch.einsum("nhwkab,nkabx->nhwkx", j_gk_sk, j_sk_pk)
+    # jacob_1
+    #   = j_c_gk @ (j_gk_uk @ j_uk_pk + j_gk_sk @ j_sk_pk)
+    #   -> [mN, tH, tW, tK, mC, 1] @ [mN, tH, tW, tK, 1, 3]
+    jacob_1 = j_c_gk[:, :, :, :, :, None] * (jacob_1_0 + jacob_1_1)[:, :, :, :, None, :]
+    # Dim = [mN, tH, tW, tK, mC, 3]
+    jacob = jacob_0 + jacob_1
+
+    # hess_0
+    #   = j_c_ck @ h_ck_pk
+    #   -> [mN, tH, tW, tK, mC, 1, 1] @ [mN, tK, mC, 3, 3]
+    #   -> [mN, tH, tW, tK, mC, 3, 3]
+    hess_0 = j_c_ck[:, :, :, :, :, None, None] * h_ck_pk[:, None, None, :, :, :, :]
+
+    # hess_1_0
+    #   = j_gk_uk @ h_uk_pk
+    #   -> [mN, tH, tW, tK, 2] @ [mN, tK, 2, 3, 3]
+    #   -> [mN, tH, tW, tK, 3, 3]
+    hess_1_0 = torch.einsum("nhwku,nkuxy->nhwkxy", j_gk_uk, h_uk_pk)
+
+    # hess_1_1
+    #   = j_gk_sk @ h_sk_pk
+    #   -> [mN, tH, tW, tK, 2, 2] @ [mN, tK, 2, 2, 3, 3]
+    #   -> [mN, tH, tW, tK, 3, 3]
+    hess_1_1 = torch.einsum("nhwkab,nkabxy->nhwkxy", j_gk_sk, h_sk_pk)
+
+    # hess_1_2
+    #   = j_uk_pk.T @ h_gk_uk @ j_uk_pk
+    #   -> [mN, tH, tW, tK, 2, 3] @ [mN, tH, tW, tK, 2, 2] @ [mN, tH, tW, tK, 2, 3]
+    hess_1_2 = torch.einsum("nhwkax,nhwkab,nhwkby->nhwkxy", j_uk_pk, h_gk_uk, j_uk_pk)
+
+    # hess_1_3
+    #   = j_sk_pk.T @ h_gk_sk @ j_sk_pk
+    #   -> [mN, tK, 2ᵃ, 2ᵇ, 3] @ [mN, tH, tW, tK, 2ᵃ, 2ᵇ, 2ᶜ, 2ᵈ] @ [mN, tK, 2ᶜ, 2ᵈ, 3]
+    hess_1_3 = torch.einsum("nkabx,nhwkabcd,nkcdy->nhwkxy", j_sk_pk, h_gk_sk, j_sk_pk)
+
+    # hess_1_4
+    #   = 2.0 * j_sk_pk.T @ h_gk_uk_sk @ j_uk_pk
+    #   -> 2.0 * [mN, tK, 2, 2, 3] @ [mN, tH, tW, tK, 2, 2, 2] @ [mN, tK, 2, 3]
+    #   -> [mN, tH, tW, tK, 3, 3]
+    hess_1_4 = 2.0 * torch.einsum(
+        "nkabx,nhwkuab,nkuy->nhwkxy", j_sk_pk, h_gk_uk_sk, j_uk_pk
+    )
+    # hess_1 = j_c_gk @ (*)
+    #   -> [mN, tH, tW, tK, mC, 1, 1] * [mN, tH, tW, 1, tK, 3, 3]
+    #   -> [mN, tH, tW, tK, mC, 3, 3]
+    hess_1 = (
+        j_c_gk[:, :, :, :, :, None, None]
+        * (hess_1_0 + hess_1_1 + hess_1_2 + hess_1_3 + hess_1_4)[:, :, :, None, :, :, :]
+    )
+    hess = hess_0 + hess_1
+
+    if masks is not None:
+        # Dim = [mN, tH, tW, tK, mC, 3] * [mN, tK]
+        jacob = jacob * masks[:, None, None, :, None, None].float()
+        # Dim = [mN, tH, tW, tK, mC, 3, 3] * [mN, tK]
+        hess = hess * masks[:, None, None, :, None, None, None].float()
+    return jacob, hess
+
+
+def _backward_l2_to_render(rd_imgs: torch.Tensor, gt_imgs: torch.Tensor):
+    """Computes Jacobian matrix from L2 to rendering RGB pixels.
+
+    Args:
+        [1] rd_imgs: Rendering images, Dim=[N, C, H, W], torch.FloatTensor.
+        [2] gt_imgs: Groundtruth images, Dim=[N, C, H, W], torch.FloatTensor.
+        [3] with_hessian: Whether to compute Hessian matrix, bool.
+
+    Returns:
+        [1] jacob: Jacobian matrix from L2 to rendering RGB pixels, Dim=[N, C, H, W], torch.FloatTensor.
+                L2 = MEAN(||rd_imgs - gt_imgs||^2)
+                RGB =  { pixel=(r, g, b) | for any pixel in rd_imgs }
+                RGB' = { pixel=(r, g, b) | for any pixel in gt_imgs }
+                ∂L2 / ∂(RGB) -> partial derivative of L2 (scalar) with respect to C (matrix)
+
+                ∂L2 / ∂(RGB)
+                    = [∂L2 / ∂R, ∂L2 / ∂G, ∂L2 / ∂B]
+                    = 2.0 * (rd_imgs - gt_imgs) / (N * C * H * W)
+        [2] hess: Hessian matrix from L2 to rendering RGB pixels, Dim=[N, C, H, W], torch.FloatTensor.
+                ∂²L2 / ∂(RGB)²
+                = [[∂²L2 / ∂R²,  ∂L2 / ∂R∂G, ∂L2 / ∂R∂B],
+                   [∂²L2 / ∂R∂G, ∂²L2 / ∂G², ∂L2 / ∂G∂B],
+                   [∂²L2 / ∂R∂B, ∂L2 / ∂G∂B, ∂²L2 / ∂B²]]
+                Since R, G and B are independent with each other,
+                = 2.0 * diagonal([1, 1, 1]).view(N, C, C, H, W)
+    """
+    n, c, h, w = rd_imgs.shape
+
+    factor = 2.0 / (n * c * h * w)
+
+    jacob = factor * (rd_imgs - gt_imgs)
+    # Dim = [mN, tH, tW, mC]
+    jacob = jacob.permute([0, 2, 3, 1])
+
+    hess = 2.0
+    return jacob, hess
+
+
+class PositionNewton(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: Dict[str, Any],
+        sh_deg: int = 3,
+        num_chs: int = 3,
+        defaults: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(params, defaults)
+
+        self._sh_deg = sh_deg
+        self._sh_deriv_funcs = cache_sh_derivative_functions(sh_deg)
+
+        self._num_chs = num_chs
+
+    def step(
+        self,
+        visibility: torch.Tensor,
+        rd_imgs: torch.Tensor,
+        gt_imgs: torch.Tensor,
+        tile_x: int,
+        tile_y: int,
+        tile_size_w: int,
+        tile_size_h: int,
+        img_w: int,
+        img_h: int,
+        view_mats: torch.Tensor,  # Dim = [mN, 4, 4]
+        cam_mats: torch.Tensor,  # Dim = [mN, 3, 3]
+        opacities: torch.Tensor,  # Dim = [tK]
+        sh_coeffs: torch.Tensor,  # Dim = [tK, (L + 1)^2, 3]
+        alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+        blend_alphas: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+        sh_colors: torch.Tensor,  # Dim = [mN, tK, 3]
+        gaussians2d: torch.Tensor,  # Dim = [mN, tH, tW, tK]
+        means2d: torch.Tensor,  # Dim = [mN, tK, 2]
+        conics2d: torch.Tensor,  # Dim = [mN, tK, 3]
+        cam_covars3d: torch.Tensor,  # Dim = [mN, tK, 3, 3]
+        pin_jacob: torch.Tensor,  # Dim = [mN, tK, 2, 3]
+        tile_pixels: torch.Tensor,  # Dim = [mN, tH, tW, 2]
+        masks: Optional[torch.Tensor] = None,  # Dim = [mN, tK]
+    ):
+        for group in self.param_groups:
+            name = group["name"]
+
+            assert len(group["params"]) == 1, "more than one tensor in group"
+            param = group["params"][0]
+
+            j_l2_c, h_l2_c = _backward_l2_to_render(rd_imgs, gt_imgs)
+
+            j_c_pk, h_c_pk = _backward_render_to_means3d(
+                self._num_chs,
+                tile_x,
+                tile_y,
+                tile_size_w,
+                tile_size_h,
+                img_w,
+                img_h,
+                view_mats,
+                cam_mats,
+                param[visibility],
+                opacities,
+                sh_coeffs,
+                self._sh_deriv_funcs,
+                alphas,
+                blend_alphas,
+                sh_colors,
+                gaussians2d,
+                means2d,
+                conics2d,
+                cam_covars3d,
+                pin_jacob,
+                tile_pixels,
+                masks,
+            )
+
+            # jacob
+            #   = j_l2_c @ j_c_pk
+            #   -> [mN, tH, tW, mC] @ [mN, tH, tW, tK, mC, 3]
+            #   -> [mN, tH, tW, tK, 3] -> [tK, 3]
+            jacob = torch.einsum("nhwc,nhwkcx->nhwkx", j_l2_c, j_c_pk)
+            jacob = jacob.sum(dim=[0, 1, 2])
+
+            # hess = j_c_pk.T @ h_l2_c @ j_c_pk + j_l2_c @ h_c_pk
+            # hess_0
+            #   = j_c_pk.T @ h_l2_c @ j_c_pk
+            #   -> [mN, tH, tW, tK, mC, 3].T @ [1] @ [mN, tH, tW, tK, mC, 3]
+            hess_0 = h_l2_c * torch.einsum(
+                "...ab,...bc->...ac", j_c_pk.transpose(-1, -2), j_c_pk
+            )
+            # hess_1
+            #   = j_l2_c @ h_c_pk
+            #   -> [mN, tH, tW, mC] @ [mN, tH, tW, tK, mC, 3, 3]
+            hess_1 = torch.einsum("nhwc,nhwkcxy->nhwkxy", j_l2_c, h_c_pk)
+            hess = hess_0 + hess_1
+            # Dim = [tK, 3, 3]
+            hess = hess.sum(dim=[0, 1, 2])
+
+            hess_inv = torch.linalg.pinv(hess)
+
+            update = -torch.einsum("kab,kb->ka", hess_inv, jacob)
+            param[visibility] += update

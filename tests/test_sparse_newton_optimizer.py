@@ -9,7 +9,8 @@ from gsplat.optimizers.torch_functions_forward import (
     blend_sh_colors_with_alphas,
     compute_sh_colors,
     compute_gaussian_weights_2d_tile,
-    project_points_3d_to_2d,
+    transform_means_3d,
+    project_means_3d,
     compute_covariance_2d_inverse,
     get_tile_size,
     compute_pinhole_jacobian,
@@ -54,7 +55,12 @@ def test_backward_render_to_sh_colors():
 
     masks = torch.randint(low=0, high=2, size=[mN, tK], **KWARGS).bool()
 
-    forward_fn = lambda x: blend_sh_colors_with_alphas(x, alphas, masks)[0]
+    forward_fn = lambda x: blend_sh_colors_with_alphas(
+        x,
+        alphas,
+        blend_alphas,
+        masks,
+    )[0]
 
     # Dim = [mN, tH, tW, mC, mN, tK, mC]
     jacob_auto = torch.autograd.functional.jacobian(forward_fn, sh_colors)
@@ -160,7 +166,7 @@ def test_backward_sh_colors_to_positions():
 
 def test_backward_render_to_gaussians2d():
     """Test backward render to gaussian 2D weights."""
-    name = "From_RENDER_to_GAUSSIANS2D"
+    name = "From_RENDER_To_GAUSSIANS2D"
 
     sh_colors = torch.rand(size=[mN, tK, mC], **KWARGS)
 
@@ -169,7 +175,9 @@ def test_backward_render_to_gaussians2d():
     opacities = torch.rand(size=[tK], **KWARGS)
 
     forward_fn = lambda _gaussians2d: blend_sh_colors_with_alphas(
-        sh_colors, alphas=_gaussians2d * opacities
+        sh_colors,
+        alphas=compute_blend_alphas(_gaussians2d * opacities)[0],
+        blend_alphas=compute_blend_alphas(_gaussians2d * opacities)[1],
     )[0]
 
     # Dim = [mN, tH, tW, mC, mN, tH, tW, tK]
@@ -221,7 +229,7 @@ def test_backward_gaussians2d_to_means2d():
     means2d = torch.stack([means2d_x, means2d_y], dim=-1)
     conics2d = torch.rand(size=[mN, tK, 3], **KWARGS) + 1.0
 
-    gausses2d, _ = compute_gaussian_weights_2d_tile(
+    gausses2d, _, _ = compute_gaussian_weights_2d_tile(
         tile_x, tile_y, tW, tH, img_w, img_h, means2d, conics2d
     )
 
@@ -288,6 +296,14 @@ def test_backward_means2d_to_means3d():
     """Test backward mean 2D positions to mean 3D positions."""
     name = "From_MEANS2D_To_MEANS3D"
 
+    def project_means3d_to_means2d(
+        _means3d: torch.Tensor, _view_mats: torch.Tensor, _cam_mats: torch.Tensor
+    ):
+        """Project a set of points from world space into camera space."""
+        _cam_means3d = transform_means_3d(_means3d, _view_mats)
+        _means2d = project_means_3d(_cam_means3d, _cam_mats)
+        return _means2d
+
     img_w = 1920
     img_h = 1080
 
@@ -337,7 +353,7 @@ def test_backward_means2d_to_means3d():
     view_idx = int(np.random.randint(0, mN))
     means3d = means3d[view_idx]
 
-    _, mean2d_proj = project_points_3d_to_2d(
+    mean2d_proj = project_means3d_to_means2d(
         means3d, view_mats[view_idx][None], cam_mats[view_idx][None]
     )
 
@@ -347,9 +363,9 @@ def test_backward_means2d_to_means3d():
     # Input:  Dim = [tK, 3]
     # Jacobian: Dim = [mN, tK, 2, 3]
     jacob_auto = torch.autograd.functional.jacobian(
-        lambda x: project_points_3d_to_2d(
+        lambda x: project_means3d_to_means2d(
             x, view_mats[view_idx][None], cam_mats[view_idx][None]
-        )[1],
+        ),
         means3d,
     )
     idxs = [i for i in range(tK)]
@@ -357,9 +373,9 @@ def test_backward_means2d_to_means3d():
     jacob_auto = jacob_auto.permute([1, 0, 2, 3])
 
     hess_auto = torch.autograd.functional.hessian(
-        lambda x: project_points_3d_to_2d(
+        lambda x: project_means3d_to_means2d(
             x, view_mats[view_idx][None], cam_mats[view_idx][None]
-        )[1].sum(),
+        ).sum(),
         means3d,
     )
     hess_auto = hess_auto[idxs, :, idxs, :]
@@ -477,7 +493,7 @@ def test_backward_gaussians2d_to_covars2d(strict=False):
         _conics2d_mat = inverse_fn(_covars2d_mat)
         _conics2d = _conics2d_mat[..., [0, 0, 1], [0, 1, 1]]
 
-        _gausses2d, _ = compute_gaussian_weights_2d_tile(
+        _gausses2d, _, _ = compute_gaussian_weights_2d_tile(
             _tile_x,
             _tile_y,
             _tile_size_w,
@@ -513,7 +529,7 @@ def test_backward_gaussians2d_to_covars2d(strict=False):
     conics2d_mat = inverse_fn(covars2d_mat)
     conics2d = conics2d_mat[..., [0, 0, 1], [0, 1, 1]]
 
-    gausses2d, _ = compute_gaussian_weights_2d_tile(
+    gausses2d, _, _ = compute_gaussian_weights_2d_tile(
         tile_x, tile_y, tW, tH, img_w, img_h, means2d, conics2d
     )
 
@@ -744,7 +760,7 @@ if __name__ == "__main__":
     test_backward_pinhole_to_means3d()
     test_backward_covars2d_to_pinhole()
     test_backward_conics2d_to_covars2d()
-    test_backward_gaussians2d_to_covars2d()
+    test_backward_gaussians2d_to_covars2d()  # NOTE. FAIL!
     test_backward_means2d_to_means3d()
     test_backward_gaussians2d_to_means2d()
     test_backward_render_to_gaussians2d()
