@@ -7,36 +7,6 @@ from torch.nn.modules.loss import _Loss
 EPS = 1e-12
 
 
-def project_points_3d_to_2d(
-    pnts3d: torch.Tensor,
-    view_mats: torch.Tensor,
-    cam_mats: torch.Tensor,
-) -> torch.Tensor:
-    """Project means from 3d world to 2d image plane.
-
-    Args:
-        [1] pnts3d: 3D positions at World Coordinate system, i.e. [tK, 3]
-        [2] view_mat: view matrix, i.e. [mN, 4, 4]
-        [3] cam_mat: camera matrix, i.e. [mN, 3, 3]
-
-    Return:
-        [1] cam_pnts3d: 3D positions at Camera coordinate system.
-        [2] img_pnts2d: 2D pixels, i.e. [tK, 2]
-    """
-    # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
-    cam_pnts3d = (
-        torch.sum(view_mats[:, None, :3, :3] * pnts3d[None, :, None, :], dim=-1)
-        + view_mats[:, :3, 3][:, None, :]
-    )
-
-    # Dim = [mN, 1, 3, 3] * [mN, tK, 1, 3] -> [mN, tK, 3]
-    img_pnts2d = torch.sum(cam_mats[:, None, :, :] * cam_pnts3d[:, :, None, :], dim=-1)
-
-    # Dim = [mN, tK, 2]
-    img_pnts2d = img_pnts2d[:, :, :2] / img_pnts2d[:, :, 2][..., None]
-    return cam_pnts3d, img_pnts2d
-
-
 def get_tile_size(
     tile_x: int, tile_y: int, tile_size_w: int, tile_size_h: int, img_w: int, img_h: int
 ):
@@ -129,6 +99,7 @@ def compute_gaussian_weights_2d_tile(
     # Dim = [mN, 1, 1, tK] - [1, tH, tW, 1] -> [mN, tH, tW, tK]
     tile_xs = means2d[:, :, 0][:, None, None, :] - tile_xs[None, :, :, None]
     tile_ys = means2d[:, :, 1][:, None, None, :] - tile_ys[None, :, :, None]
+    tile_pixels = torch.stack([tile_xs, tile_ys], dim=-1)
 
     # Dim = [mN, tH, tW, tK] * [mN, 1, 1, tK] -> [mN, tH, tW, tK]
     sigmas = 0.5 * (
@@ -140,7 +111,7 @@ def compute_gaussian_weights_2d_tile(
     # Dim = [mN, tH, tW, tK]
     gausses2d = torch.exp(-sigmas)
     tile_bbox = (tile_xmin, tile_ymin, crop_w, crop_h)
-    return gausses2d, tile_bbox
+    return gausses2d, tile_pixels, tile_bbox
 
 
 def compute_pinhole_jacobian(
@@ -231,7 +202,54 @@ def compute_covariance_2d_inverse(
     return conics2d, det
 
 
-def project_gaussians_3d_to_2d(
+def transform_means_3d(means3d: torch.Tensor, view_mats: torch.Tensor):
+    """Apply SE3 transform to mean3d vectors."""
+    # Dim = [mN, 1, 3, 3] * [1, tK, 1, 3] + [mN, 1, 3] -> [mN, tK, 3]
+    tf_means3d = (
+        torch.sum(view_mats[:, None, :3, :3] * means3d[None, :, None, :], dim=-1)
+        + view_mats[:, :3, 3][:, None, :]
+    )
+    return tf_means3d
+
+
+def transform_covariance_3d(covars3d: torch.Tensor, view_mats: torch.Tensor):
+    """Apply SE3 transform to covariance matrices."""
+    # Dim = [mN, 3, 3]
+    rot_mats = view_mats[:, :3, :3]
+    # Dim = [mN, 3, 3] @ [tK, 3, 3] @ [mN, 3, 3].T -> [mN, tK, 3, 3]
+    tf_covars3d = torch.einsum(
+        "ijk,lkm,imn->iljn", rot_mats, covars3d, rot_mats.transpose(-1, -2)
+    )
+    return tf_covars3d
+
+
+def project_means_3d(means3d: torch.Tensor, cam_mats: torch.Tensor):
+    """Project points from world space into camera space."""
+    # Dim = [mN, 1, 3, 3] * [mN, tK, 1, 3] -> [mN, tK, 3]
+    means2d = torch.sum(cam_mats[:, None, :, :] * means3d[:, :, None, :], dim=-1)
+
+    # Dim = [mN, tK, 2]
+    means2d = means2d[:, :, :2] / means2d[:, :, 2][..., None]
+    return means2d
+
+
+def project_covariance_3d(
+    means3d: torch.Tensor, covars3d: torch.Tensor, cam_mats: torch.Tensor
+):
+    """Project covariances from world space into camera space."""
+    img_w = cam_mats[:, 0, 2] * 2.0
+    img_h = cam_mats[:, 1, 2] * 2.0
+
+    # Dim = [mN, tK, 2, 3]
+    pin_jacob = compute_pinhole_jacobian(cam_mats, means3d, img_w, img_h)
+    # Dim = [mN, tK, 2, 3] @ [mN, tK, 3, 3] @ [mN, tK, 2, 3].T
+    covars2d = torch.einsum(
+        "ijkl,ijlm,ijmn->ijkn", pin_jacob, covars3d, pin_jacob.transpose(-1, -2)
+    )
+    return covars2d, pin_jacob
+
+
+def project_3d_to_2d_fused(
     view_mats: torch.Tensor,
     cam_mats: torch.Tensor,
     means3d: torch.Tensor,
@@ -250,8 +268,6 @@ def project_gaussians_3d_to_2d(
         [2] cam_mats: Dim = [mN, 3, 3]
         [3] means3d:  Dim = [tK, 3]
         [4] covars3d: Dim = [tK, 3, 3]
-        [5] img_w: int
-        [6] img_h: int
         [7] opacities: [tK]
         [8] alpha_threshold: float
 
@@ -261,24 +277,14 @@ def project_gaussians_3d_to_2d(
 
         covars2d = J @ W @ covars3d @ W.T @ J.T
     """
-    cam_means3d, means2d = project_points_3d_to_2d(means3d, view_mats, cam_mats)
+    cam_means3d = transform_means_3d(means3d, view_mats)
+    cam_covars3d = transform_covariance_3d(covars3d, view_mats)
+
+    means2d = project_means_3d(cam_means3d, cam_mats)
+    covars2d, pin_jacob = project_covariance_3d(cam_means3d, cam_covars3d, cam_mats)
 
     # Dim = [mN, tK]
     depths = cam_means3d[..., 2]
-
-    # Dim = [mN, 3, 3]
-    rot_mats = view_mats[:, :3, :3]
-    # Dim = [mN, 3, 3] @ [tK, 3, 3] @ [mN, 3, 3].T -> [mN, tK, 3, 3]
-    cam_covars3d = torch.einsum(
-        "ijk,lkm,imn->iljn", rot_mats, covars3d, rot_mats.transpose(-1, -2)
-    )
-
-    # Dim = [mN, tK, 2, 3]
-    pin_jacob = compute_pinhole_jacobian(cam_mats, cam_means3d, img_w, img_h)
-    # Dim = [mN, tK, 2, 3] @ [mN, tK, 3, 3] @ [mN, tK, 2, 3].T
-    covars2d = torch.einsum(
-        "ijkl,ijlm,ijmn->ijkn", pin_jacob, cam_covars3d, pin_jacob.transpose(-1, -2)
-    )
 
     conics2d, det = compute_covariance_2d_inverse(covars2d)
     conics2d = conics2d[..., [0, 0, 1], [0, 1, 1]]
@@ -313,7 +319,14 @@ def project_gaussians_3d_to_2d(
     radius[~inside] = 0.0
 
     radii = radius.int()
-    return means2d, conics2d, depths, radii
+    return (
+        means2d,
+        conics2d,
+        depths,
+        radii,
+        cam_covars3d,
+        pin_jacob,
+    )
 
 
 def combine_sh_colors_from_coefficients(
@@ -502,7 +515,7 @@ def rasterize_to_pixels_tile_forward(
     # Dim = [tK, 3, 3]
     covars3d = compute_covariance_3d(quats, scales)
 
-    means2d, conics2d, depths, radii = project_gaussians_3d_to_2d(
+    means2d, conics2d, depths, radii, cam_covars3d, pin_jacob = project_3d_to_2d_fused(
         view_mats,
         cam_mats,
         means3d,
@@ -521,7 +534,7 @@ def rasterize_to_pixels_tile_forward(
         masks = (radii > 0).all(dim=-1).float()
 
     # Dim = [mN, tH, tW, tK]
-    gausses2d, tile_bbox = compute_gaussian_weights_2d_tile(
+    gausses2d, tile_pixels, tile_bbox = compute_gaussian_weights_2d_tile(
         tile_x, tile_y, tile_size_w, tile_size_h, img_w, img_h, means2d, conics2d
     )
 
@@ -543,6 +556,7 @@ def rasterize_to_pixels_tile_forward(
     rd_alphas = rd_alphas.permute([0, 3, 1, 2])
 
     rd_meta = {
+        "tile_pixels": tile_pixels,
         "tile_bbox": tile_bbox,
         "alphas": alphas,
         "blend_alphas": blend_alphas,
@@ -553,6 +567,8 @@ def rasterize_to_pixels_tile_forward(
         "conics2d": conics2d,
         "covars3d": covars3d,
         "sh_colors": sh_colors,
+        "pinhole": pin_jacob,
+        "cam_covars3d": cam_covars3d,
     }
     return rd_colors, rd_alphas, rd_meta
 
