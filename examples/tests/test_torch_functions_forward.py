@@ -261,7 +261,7 @@ def test_rasterization_tile_forward():
 
             flat_idxs = flatten_ids[isect_start:isect_end]
 
-            tile_rgb, _, tile_bbox = rasterize_to_pixels_tile_forward(
+            tile_rgb, _, tile_meta = rasterize_to_pixels_tile_forward(
                 tile_x,
                 tile_y,
                 tile_size,
@@ -282,7 +282,7 @@ def test_rasterization_tile_forward():
             end = time.time()
             tile_elapsed = float(end - start)
 
-            tile_xmin, tile_ymin, crop_w, crop_h = tile_bbox
+            tile_xmin, tile_ymin, crop_w, crop_h = tile_meta["tile_bbox"]
 
             rd_rgb = rd_img[
                 :, :, tile_ymin : (tile_ymin + crop_h), tile_xmin : (tile_xmin + crop_w)

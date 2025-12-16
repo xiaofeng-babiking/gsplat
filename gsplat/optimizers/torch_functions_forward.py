@@ -447,19 +447,25 @@ def compute_sh_colors(
     return sh_colors
 
 
-def blend_sh_colors_with_alphas(
-    sh_colors: torch.Tensor,
-    alphas: torch.Tensor,
-    masks: Optional[torch.Tensor] = None,
-):
-    """Render spherical harmonics colors with alphas."""
-    alphas = torch.clamp_max(alphas, 0.9999)
+def compute_blend_alphas(alphas: torch.Tensor, clamped: bool = True):
+    """Compute blended alphas by cumprod."""
+    if clamped:
+        alphas = torch.clamp_max(alphas, 0.9999)
 
     # Dim = [mN, tH, tW, tK]
     blend_alphas = torch.cumprod(1.0 - alphas, dim=-1)
     blend_alphas = torch.roll(blend_alphas, shifts=1, dims=-1)
     blend_alphas[:, :, :, 0] = 1.0
+    return alphas, blend_alphas
 
+
+def blend_sh_colors_with_alphas(
+    sh_colors: torch.Tensor,
+    alphas: torch.Tensor,
+    blend_alphas: torch.Tensor,
+    masks: Optional[torch.Tensor] = None,
+):
+    """Render spherical harmonics colors with alphas."""
     # Dim = [mN, tH, tW, mC]
     rd_colors = torch.sum(
         alphas[:, :, :, :, None]  # Dim = [mN,  tH, tW, tK, 1]
@@ -523,14 +529,32 @@ def rasterize_to_pixels_tile_forward(
 
     # Dim = [mN, tH, tW, tK]
     alphas = gausses2d * opacities
-    rd_colors, rd_alphas = blend_sh_colors_with_alphas(sh_colors, alphas, masks)
+
+    alphas, blend_alphas = compute_blend_alphas(alphas)
+
+    rd_colors, rd_alphas = blend_sh_colors_with_alphas(
+        sh_colors, alphas, blend_alphas, masks
+    )
 
     # tile_rgb = torch.clamp(tile_rgb, min=0.0, max=1.0)
     rd_colors = rd_colors.permute([0, 3, 1, 2])
 
     # Dim = [mN, tH, tW, 1]
     rd_alphas = rd_alphas.permute([0, 3, 1, 2])
-    return rd_colors, rd_alphas, tile_bbox
+
+    rd_meta = {
+        "tile_bbox": tile_bbox,
+        "alphas": alphas,
+        "blend_alphas": blend_alphas,
+        "gaussians2d": gausses2d,
+        "radii": radii,
+        "masks": masks,
+        "means2d": means2d,
+        "conics2d": conics2d,
+        "covars3d": covars3d,
+        "sh_colors": sh_colors,
+    }
+    return rd_colors, rd_alphas, rd_meta
 
 
 def compute_kernel_mean_2d(img: torch.Tensor, kernel: torch.Tensor):
